@@ -1,0 +1,29 @@
+[workspace]
+authors = ["afragrant <394451070@qq.com>"]
+channels = ["conda-forge"]
+name = "drl_control_procs"
+platforms = [
+    {"platform" = "linux-64", cuda="13.3"},
+    {"platform" = "win-64", cuda="13.3"}
+]
+version = "0.1.0"
+
+[tasks]
+tensorboard = "tensorboard --logdir"
+
+
+[dependencies]
+python = "==3.12.13"
+
+
+[pypi-dependencies]
+pandas = ">=3.0.5, <4"
+matplotlib = ">=3.10.0, <4"
+torch = ">=2.13.0, <3"
+torchvision = ">=0.28.0, <0.29"
+numpy = ">=2.5.2, <3"
+torchrl = ">=0.13.3, <0.14"
+gymnasium = ">=1.0.0, <2"
+tensorboard = ">=2.18.0, <3"
+pyyaml = ">=6.0, <7"
+scipy = ">=1.14.0, <2"
