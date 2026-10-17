@@ -92,7 +92,7 @@ def run(
     envs = make_envs(config)
     agent = None
     try:
-        assert_spaces(envs, obs_shape=(history_length, 5))
+        assert_spaces(envs, obs_shape=(history_length, 6))
         from algorithm.SAC import SACAgent
 
         agent = SACAgent(config, envs)

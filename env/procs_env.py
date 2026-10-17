@@ -5,6 +5,9 @@ from typing import Any, ClassVar
 
 import gymnasium as gym
 import numpy as np
+from scipy.signal import butter, sosfilt, sosfilt_zi
+
+from utils.env_utils import DEFAULT_CUTOFF_HZ, DEFAULT_ORDER
 
 from .procs_core import (
     N_SKIP_SPANS,
@@ -15,23 +18,23 @@ from .procs_core import (
     target_contact_force,
 )
 
-DIVERGENCE_PENALTY = 600.0
+# 未缩放奖励下每步 ≈ -0.01（零控）、正常回合回报 ≈ -2~-10；发散罚须明显差于跑完全程
+DIVERGENCE_PENALTY = 30.0
 MAX_CONTACT_FORCE_N = 300.0
 CONSTRAINT_WEIGHT = 5.0
+# force_mse 已含步均值偏差²（权重 1）；再加十倍直流，总系数 11。
+# 种子 18–20 在 280 km/h 上用下压换方差，要总系数大于 9.5 才比被动控制亏。
+BIAS_PENALTY_WEIGHT = 10.0
+# 跟踪项速度权重：s_r=v_ref/min(v,v_ref)，锚在训练上限。不缩放动作。
+V_REF_KMH = 300.0
+
+
+def track_scale(speed_kmh: float) -> float:
+    r = min(max(float(speed_kmh), 0.0), V_REF_KMH) / V_REF_KMH
+    return 1.0 / r if r > 0.0 else 1.0
 
 
 class ProcsEnv(gym.Env):
-    """受电弓主动控制 Gymnasium 环境。
-
-    观测：弓头位移 y1、速度 v1、加速度 a1、列车速度 v_train、接触力 Fc。
-    动作：施加于下框架 m3 的主动控制力 f3（范围 ±action_max N）。
-    决策频率 control_freq Hz；每个决策保持约
-    round(1/(control_freq*dt_base)) 个内部 Newmark 步。
-    每个回合只覆盖稳定段（剔除首尾各 skip_spans 跨）：reset 时无控制
-    滑行至稳定段起点，到达稳定段终点即 terminated（自然终止，非 truncated）。
-    truncated 仅用于外部时间步上限等硬性截断。
-    """
-
     metadata: ClassVar[dict[str, Any]] = {'render_modes': []}
 
     def __init__(
@@ -99,12 +102,16 @@ class ProcsEnv(gym.Env):
 
         self.n_inner = max(1, round(1.0 / (control_freq * dt_base)))
 
-        # 观测空间：y1[m], v1[m/s], a1[m/s²], v_train[m/s], Fc[N]
-        obs_low = np.array([-1.0, -50.0, -500.0, -100.0, 0.0], dtype=np.float32)
-        obs_high = np.array([1.0, 50.0, 500.0, 100.0, np.inf], dtype=np.float32)
+        # 评估统计用的 20 Hz 因果低通（与 utils.env_utils.filter_contact_force 同参数）；奖励不用
+        self._eval_sos = butter(DEFAULT_ORDER, DEFAULT_CUTOFF_HZ, fs=1.0 / dt_base, output='sos')
+        self._eval_zi: np.ndarray | None = None
+
+        # 观测空间：y1[m], v1[m/s], a1[m/s²], v_train[m/s], Fc[N], a_{t-1}
+        obs_low = np.array([-1.0, -50.0, -500.0, -100.0, 0.0, -1.0], dtype=np.float32)
+        obs_high = np.array([1.0, 50.0, 500.0, 100.0, np.inf, 1.0], dtype=np.float32)
         self.observation_space = gym.spaces.Box(obs_low, obs_high, dtype=np.float32)
 
-        # 动作空间：归一化后 [-1, 1]，训练时再映射为 ±action_max N
+        # 动作空间：归一化后 [-1, 1]，再映射为 ±action_max N
         self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
 
         # 最慢车速，用于估算需要最多的控制步
@@ -164,8 +171,19 @@ class ProcsEnv(gym.Env):
         k_end = int(np.searchsorted(positions, total_length - self.skip_spans * span_length, side='right'))
         return math.ceil((k_end - max(1, k_start)) / self.n_inner)
 
+    def _prime_eval_filter(self, burn_hist: dict | None) -> np.ndarray:
+        """用滑行段接触力把评估低通推到稳态，避免稳定段开头的滤波瞬态进 RMSE。"""
+        fc_burn = np.asarray(burn_hist['contact_force'], dtype=np.float64) if burn_hist else np.empty(0)
+        if fc_burn.size:
+            zi = sosfilt_zi(self._eval_sos) * fc_burn[0]
+            _, zi = sosfilt(self._eval_sos, fc_burn, zi=zi)
+            return zi
+        return sosfilt_zi(self._eval_sos) * float(self._core.F0)
+
     def _observation(self) -> np.ndarray:
-        return self._core.current_observation().astype(np.float32)
+        # 末维是产生当前观测的上一步归一化动作；reset 时为 0。当前步动作只进评论家。
+        plant = self._core.current_observation().astype(np.float32)
+        return np.concatenate([plant, np.array([self._previous_action], dtype=np.float32)])
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
@@ -189,10 +207,10 @@ class ProcsEnv(gym.Env):
         else:
             self._core.reset(speed_kmh=speed)
 
-        # 无控制滑行至稳定段起点（启动瞬态不计入训练）
+        # 无控制滑行至稳定段起点（启动瞬态不计入训练）；评估时预热统计用低通
         burn = self._core.k_start - 1
-        if burn > 0:
-            self._core.advance(burn, 0.0)
+        burn_hist = self._core.advance(burn, 0.0) if burn > 0 else None
+        self._eval_zi = self._prime_eval_filter(burn_hist) if self.record_eval_trajectory else None
 
         self._episode_steps = 0
         self._episode_return = 0.0
@@ -222,6 +240,7 @@ class ProcsEnv(gym.Env):
         try:
             hist = self._core.advance(self.n_inner, f3)
         except FloatingPointError:
+            self._previous_action = normalized_action
             obs = self._observation()
             if not np.isfinite(obs).all():
                 obs = np.zeros(self.observation_space.shape, dtype=np.float32)
@@ -240,11 +259,16 @@ class ProcsEnv(gym.Env):
                 },
             )
         fc = hist['contact_force']  # 控制步内的接触力
-        obs = self._observation()
+        if hist['n_actual'] == 0:
+            # 这一步没有推进仿真，观测仍对应当前状态和产生它的动作
+            return self._observation(), 0.0, False, True, {}
 
         # 发散 / NaN：仿真状态已失效，统一终止并给大惩罚（离线 fc=0 不算发散）
-        if (fc.size and not np.isfinite(fc).all()) or not np.isfinite(obs).all():
-            if not np.isfinite(obs).all():
+        plant_ok = np.isfinite(self._core.current_observation()).all()
+        if (fc.size and not np.isfinite(fc).all()) or not plant_ok:
+            self._previous_action = normalized_action
+            obs = self._observation()
+            if not plant_ok:
                 obs = np.zeros(self.observation_space.shape, dtype=np.float32)
             self._episode_steps += 1
             self._episode_return += -DIVERGENCE_PENALTY
@@ -255,20 +279,19 @@ class ProcsEnv(gym.Env):
                 False,
                 {
                     'diverged': True,
+                    'reason': 'contact_nonconvergence',
                     'episode_step': self._episode_steps,
                     'episode_return': self._episode_return,
                 },
             )
 
-        if hist['n_actual'] == 0:
-            # step() 在到达终点后被继续调用
-            return obs, 0.0, True, False, {}
-
         target_force = self.target_contact_force(self._core.speed_kmh)
         n_actual = int(hist['n_actual'])
         mean_fc = float(fc.mean())
         std_fc = float(fc.std())
-        force_mse = float(np.mean(((fc - target_force) / target_force) ** 2))  # 力跟踪误差
+        force_mse = float(np.mean(((fc - target_force) / target_force) ** 2))
+        rel_bias = (mean_fc - target_force) / target_force
+        bias_penalty = BIAS_PENALTY_WEIGHT * rel_bias**2
         n_loss = int((fc <= 0.0).sum())  # 离线步数
         n_overforce = int((fc >= MAX_CONTACT_FORCE_N).sum())  # 超过300N的步数
         loss_fraction = n_loss / n_actual  # 离线比
@@ -279,15 +302,21 @@ class ProcsEnv(gym.Env):
         action_delta = normalized_action - self._previous_action
         action_rate_penalty = self.action_rate_weight * action_delta**2  # 惩罚动作变化太快
 
+        scale = track_scale(self._core.speed_kmh)
         reward = (
-            -force_mse - CONSTRAINT_WEIGHT * (loss_fraction + overforce_fraction) - action_penalty - action_rate_penalty
+            -force_mse * scale
+            - bias_penalty * scale
+            - CONSTRAINT_WEIGHT * (loss_fraction + overforce_fraction)
+            - action_penalty
+            - action_rate_penalty
         )
 
         self._previous_action = normalized_action
+        obs = self._observation()
 
-        at_end = self._core.done()
-        terminated = at_end
-        truncated = False
+        # 稳定段跑完是时间性截断：TD 目标仍自举末状态价值；terminated 留给发散
+        terminated = False
+        truncated = self._core.done()
 
         self._episode_steps += 1
         self._episode_return += reward
@@ -298,6 +327,8 @@ class ProcsEnv(gym.Env):
             'min_Fc_N': min_fc,
             'max_Fc_N': max_fc,
             'force_mse': force_mse,
+            'bias_penalty': bias_penalty,
+            'track_scale': scale,
             'loss_fraction': loss_fraction,
             'overforce_fraction': overforce_fraction,
             'n_loss': n_loss,
@@ -314,6 +345,8 @@ class ProcsEnv(gym.Env):
             info['trajectory_time_s'] = hist['time_s']
             info['trajectory_position_m'] = hist['position_m']
             info['trajectory_contact_force_N'] = fc.astype(np.float64, copy=False)
+            fc_filtered, self._eval_zi = sosfilt(self._eval_sos, fc.astype(np.float64, copy=False), zi=self._eval_zi)
+            info['trajectory_contact_force_filtered_N'] = fc_filtered.astype(np.float64, copy=False)
             info['trajectory_control_force_N'] = np.full(n_actual, f3, dtype=np.float64)
         return obs, float(reward), terminated, truncated, info
 

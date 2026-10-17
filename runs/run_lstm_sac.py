@@ -99,7 +99,7 @@ def run(
     agent = None
     sac_agent = None
     try:
-        assert_spaces(envs, obs_shape=(history_length, 5))
+        assert_spaces(envs, obs_shape=(history_length, 6))
         from algorithm.SAC import SACAgent
 
         agent = SACAgent(config, envs)
@@ -128,7 +128,7 @@ def run(
                 sac_history_length = require_history_length(sac_config)
                 sac_envs = make_envs(sac_config)
                 try:
-                    assert_spaces(sac_envs, obs_shape=(sac_history_length, 5))
+                    assert_spaces(sac_envs, obs_shape=(sac_history_length, 6))
                     sac_agent = SACAgent(sac_config, sac_envs)
                     sac_load_dir, sac_load_name = sac_model_load
                     sac_agent.load_model(sac_load_dir, sac_load_name)
