@@ -22,8 +22,11 @@ from env import close_envs, make_envs
 from env.procs_env import parse_history_length
 from utils.config import load_config
 from utils.run_utils import (
+    add_robustness_arguments,
     assert_spaces,
+    configure_actuator,
     configure_irregularity,
+    configure_plant,
     configure_speed_run,
     eval_condition_name,
     eval_run_name,
@@ -48,6 +51,12 @@ def require_history_length(config) -> int:
     return history_length
 
 
+def observation_shape(history_length: int) -> tuple[int, ...]:
+    if history_length <= 0:
+        raise ValueError(f'history_length must be positive, got {history_length}')
+    return (history_length, 4)
+
+
 def run(
     command: str,
     steps: int | None,
@@ -59,6 +68,10 @@ def run(
     irregularity: bool | None = None,
     wear_amplitude: float | None = None,
     wear_wavelength: float | None = None,
+    actuator_delta: float | None = None,
+    actuator_noise_std: float | None = None,
+    pantograph: int | None = None,
+    catenary: int | None = None,
 ) -> None:
     validate_lstm_sac_test_model(command, model)
     model_load = load_path(model) if command == 'test' else None
@@ -85,6 +98,13 @@ def run(
         wear_amplitude=wear_amplitude,
         wear_wavelength=wear_wavelength,
     )
+    env_kwargs = configure_actuator(
+        env_kwargs,
+        actuator_delta=actuator_delta,
+        actuator_noise_std=actuator_noise_std,
+    )
+    env_kwargs = configure_plant(env_kwargs, pantograph=pantograph, catenary=catenary)
+    print(f'condition: {eval_condition_name(env_kwargs)}')
     config.env_kwargs = env_kwargs
     validate_sac_training_steps(
         command,
@@ -99,7 +119,7 @@ def run(
     agent = None
     sac_agent = None
     try:
-        assert_spaces(envs, obs_shape=(history_length, 6))
+        assert_spaces(envs, obs_shape=observation_shape(history_length))
         from algorithm.SAC import SACAgent
 
         agent = SACAgent(config, envs)
@@ -128,7 +148,7 @@ def run(
                 sac_history_length = require_history_length(sac_config)
                 sac_envs = make_envs(sac_config)
                 try:
-                    assert_spaces(sac_envs, obs_shape=(sac_history_length, 6))
+                    assert_spaces(sac_envs, obs_shape=(sac_history_length, 4))
                     sac_agent = SACAgent(sac_config, sac_envs)
                     sac_load_dir, sac_load_name = sac_model_load
                     sac_agent.load_model(sac_load_dir, sac_load_name)
@@ -167,12 +187,16 @@ def main() -> None:
     parser.add_argument('command', choices=('train', 'test'))
     parser.add_argument('--steps', type=int, default=None, help='override running_steps')
     parser.add_argument('--model', type=str, default=None, help='LSTM-SAC checkpoint file or seed_* directory')
-    parser.add_argument('--speed', type=float, default=None, help='fixed training speed in km/h')
+    parser.add_argument(
+        '--speed',
+        type=float,
+        nargs='+',
+        default=None,
+        help='fixed speed in km/h; each speed is trained and saved as its own model',
+    )
     parser.add_argument('--seed', type=int, default=None, help='override algorithm and environment seed')
     parser.add_argument('--eval-seed', type=int, default=101, help='test rollout seed for stochastic environments')
-    parser.add_argument('--irregularity', action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument('--WEAR_AMPLITUDE', '--wear-amplitude', dest='wear_amplitude', type=float, default=None)
-    parser.add_argument('--WEAR_WAVELENGTH', '--wear-wavelength', dest='wear_wavelength', type=float, default=None)
+    add_robustness_arguments(parser)
     parser.add_argument(
         '--sac-model',
         type=str,
@@ -184,18 +208,28 @@ def main() -> None:
         mp.set_start_method('spawn')
     except RuntimeError:
         pass
-    run(
-        args.command,
-        args.steps,
-        args.model,
-        args.sac_model,
-        args.speed,
-        args.seed,
-        args.eval_seed,
-        args.irregularity,
-        args.wear_amplitude,
-        args.wear_wavelength,
-    )
+    speeds = args.speed or [None]
+    if args.command != 'train' and len(speeds) > 1:
+        parser.error('test accepts a single --speed')
+    for speed in speeds:
+        if speed is not None:
+            print(f'{args.command} {speed:g} km/h')
+        run(
+            args.command,
+            args.steps,
+            args.model,
+            args.sac_model,
+            speed,
+            args.seed,
+            args.eval_seed,
+            args.irregularity,
+            args.wear_amplitude,
+            args.wear_wavelength,
+            args.actuator_delta,
+            args.actuator_noise_std,
+            args.pantograph,
+            args.catenary,
+        )
 
 
 if __name__ == '__main__':

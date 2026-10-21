@@ -1,0 +1,56 @@
+env_seed: 1
+vectorize: "SubprocVecEnv"
+representation: "Recurrent_LSTM"
+
+env_kwargs:
+  speed_kmh: 200.0
+  # 每回合在 [200, 300] km/h 均匀采样。评估 200/220/240/260/280/300。
+  speed_range_kmh: [200.0, 300.0]
+  dt_base: 1.0e-4
+  control_freq: 100.0
+  action_max: 50.0
+  action_rate_weight: 0.01
+  action_penalty_weight: 0.001
+  wear_amplitude: 0.001
+  wear_wavelength: 0.6
+  irregularity: false
+  # 0：不堆叠帧，factory 不会加 CatFrames。历史放在 LSTM 状态里。
+  history_length: 0
+
+representation_hidden_size: [128]
+actor_hidden_size: [256]
+critic_hidden_size: [256]
+activation: "relu"
+
+seed: 1
+parallels: 4
+buffer_size: 200000
+# 每次更新采样的连续片段条数，不是转移条数。
+batch_size: 64
+# 学习段长度。200–300 km/h 正常回合是 135–215 步，短于 240 时从回合起点取整段再补齐。
+sequence_length: 240
+# actor 慢于 critic。价值拟合住之后策略仍每步更新，高速段评估会漂。
+learning_rate_actor: 0.0001
+learning_rate_critic: 0.0003
+learning_rate_alpha: 0.0003
+gamma: 0.995
+alpha: 0.2
+use_automatic_entropy_tuning: True
+target_entropy: 0.3
+tau: 0.005
+
+training_frequency: 8
+running_steps: 500000
+start_training: 5000
+n_epochs: 1
+
+use_grad_clip: True
+grad_clip_norm: 0.5
+use_obsnorm: True
+obsnorm_range: 5
+
+device: "cuda:0"
+test_mode: False
+eval_interval: 25000
+log_dir: "logs/recurrent_sac/"
+model_dir: "models/recurrent_sac/"

@@ -5,33 +5,32 @@ from typing import Any, ClassVar
 
 import gymnasium as gym
 import numpy as np
-from scipy.signal import butter, sosfilt, sosfilt_zi
-
-from utils.env_utils import DEFAULT_CUTOFF_HZ, DEFAULT_ORDER
 
 from .procs_core import (
+    DT_BASE,
     N_SKIP_SPANS,
     WEAR_AMPLITUDE,
     WEAR_WAVELENGTH,
     ProcsCore,
+    actuator_force,
     rigid_overhead_contact_system_params,
     target_contact_force,
 )
 
-# 未缩放奖励下每步 ≈ -0.01（零控）、正常回合回报 ≈ -2~-10；发散罚须明显差于跑完全程
-DIVERGENCE_PENALTY = 30.0
-MAX_CONTACT_FORCE_N = 300.0
-CONSTRAINT_WEIGHT = 5.0
-# force_mse 已含步均值偏差²（权重 1）；再加十倍直流，总系数 11。
-# 种子 18–20 在 280 km/h 上用下压换方差，要总系数大于 9.5 才比被动控制亏。
-BIAS_PENALTY_WEIGHT = 10.0
-# 跟踪项速度权重：s_r=v_ref/min(v,v_ref)，锚在训练上限。不缩放动作。
-V_REF_KMH = 300.0
+# 正常回合的折扣回报大约 -10～-20。发散须明显更差。
+DIVERGENCE_PENALTY = 1500.0
+# 慢均值时间常数。100 Hz 时每步混入约 2.47%，跨距起伏留下大约 4%。
+SLOW_MEAN_TAU_S = 0.4
+# 二次段到目标力的 5%。再往外改线性，大直流仍有梯度，但不会平方到几千。
+SLOW_MEAN_REL_TOL = 0.05
 
 
-def track_scale(speed_kmh: float) -> float:
-    r = min(max(float(speed_kmh), 0.0), V_REF_KMH) / V_REF_KMH
-    return 1.0 / r if r > 0.0 else 1.0
+def slow_mean_penalty(relative_bias: float, tol: float = SLOW_MEAN_REL_TOL) -> float:
+    """|b|≤tol 为 (b/tol)^2，之外为 2|b|/tol−1。结点上函数值和斜率都连续。"""
+    magnitude = abs(relative_bias) / tol
+    if magnitude <= 1.0:
+        return magnitude**2
+    return 2.0 * magnitude - 1.0
 
 
 class ProcsEnv(gym.Env):
@@ -43,22 +42,24 @@ class ProcsEnv(gym.Env):
         rigid_overhead_contact_system: int = 3,
         NM: int = 200,
         N_spans: int = 30,
-        dt_base: float = 1e-4,
+        dt_base: float = DT_BASE,
         speed_kmh: float = 200.0,
         speed_range_kmh: tuple[float, float] | None = (200.0, 300.0),
         irregularity: bool = False,
         wear_amplitude: float = WEAR_AMPLITUDE,
         wear_wavelength: float = WEAR_WAVELENGTH,
+        actuator_delta: float = 1.0,
+        actuator_noise_std: float = 0.0,
         pantograph_param_scale: dict[str, float] | None = None,
         skip_spans: int = N_SKIP_SPANS,
         control_freq: float = 100.0,
         action_max: float = 100.0,
-        action_rate_weight: float = 0.001,
-        action_penalty_weight: float = 0.01,
+        action_rate_weight: float = 0.01,
+        action_penalty_weight: float = 0.001,
         max_newton_iter: int = 10,
         record_eval_trajectory: bool = False,
     ):
-        """speed_range_kmh 给 (lo, hi) 即每回合均匀随机。"""
+        """speed_range_kmh 给 (lo, hi) 即每回合均匀随机。单个速度训练时把它设为 None。"""
         super().__init__()
 
         self.pantograph = pantograph
@@ -71,9 +72,10 @@ class ProcsEnv(gym.Env):
         self.irregularity = bool(irregularity)
         self.wear_amplitude = float(wear_amplitude)
         self.wear_wavelength = float(wear_wavelength)
+        self.actuator_delta = float(actuator_delta)
+        self.actuator_noise_std = float(actuator_noise_std)
         self.pantograph_param_scale = pantograph_param_scale
         self.skip_spans = skip_spans
-        self.control_freq = control_freq
         self.action_max = float(action_max)
         self.action_rate_weight = float(action_rate_weight)
         self.action_penalty_weight = float(action_penalty_weight)
@@ -86,8 +88,13 @@ class ProcsEnv(gym.Env):
             raise ValueError(f'speed_kmh must be finite and positive, got {speed_kmh}')
         if not np.isfinite(control_freq) or control_freq <= 0:
             raise ValueError(f'control_freq must be finite and positive, got {control_freq}')
-        if control_freq * dt_base > 1.0:
-            raise ValueError('control_freq cannot exceed the internal simulation frequency')
+        # 一个控制周期内保持同一动作；周期必须是积分步长的整数倍
+        period = 1.0 / float(control_freq)
+        n_inner = int(round(period / float(dt_base)))
+        if n_inner < 1 or not np.isclose(n_inner * float(dt_base), period, rtol=1e-6, atol=0.0):
+            raise ValueError(
+                f'1/control_freq must be a positive integer multiple of dt_base, got control_freq={control_freq}, dt_base={dt_base}'
+            )
         if not np.isfinite(self.action_max) or self.action_max <= 0:
             raise ValueError(f'action_max must be finite and positive, got {action_max}')
         if not np.isfinite(self.action_rate_weight) or self.action_rate_weight < 0:
@@ -98,17 +105,19 @@ class ProcsEnv(gym.Env):
             raise ValueError(f'wear_amplitude must be finite and non-negative, got {wear_amplitude}')
         if not np.isfinite(self.wear_wavelength) or self.wear_wavelength <= 0:
             raise ValueError(f'wear_wavelength must be finite and positive, got {wear_wavelength}')
+        if not np.isfinite(self.actuator_delta) or self.actuator_delta < 0:
+            raise ValueError(f'actuator_delta must be finite and non-negative, got {actuator_delta}')
+        if not np.isfinite(self.actuator_noise_std) or self.actuator_noise_std < 0:
+            raise ValueError(f'actuator_noise_std must be finite and non-negative, got {actuator_noise_std}')
         self._validate_range('speed_range_kmh', speed_range_kmh, lower=0.0, inclusive=False)
 
-        self.n_inner = max(1, round(1.0 / (control_freq * dt_base)))
+        self.control_freq = float(control_freq)
+        self.n_inner = n_inner
+        self._slow_beta = 1.0 - math.exp(-(1.0 / self.control_freq) / SLOW_MEAN_TAU_S)
 
-        # 评估统计用的 20 Hz 因果低通（与 utils.env_utils.filter_contact_force 同参数）；奖励不用
-        self._eval_sos = butter(DEFAULT_ORDER, DEFAULT_CUTOFF_HZ, fs=1.0 / dt_base, output='sos')
-        self._eval_zi: np.ndarray | None = None
-
-        # 观测空间：y1[m], v1[m/s], a1[m/s²], v_train[m/s], Fc[N], a_{t-1}
-        obs_low = np.array([-1.0, -50.0, -500.0, -100.0, 0.0, -1.0], dtype=np.float32)
-        obs_high = np.array([1.0, 50.0, 500.0, 100.0, np.inf, 1.0], dtype=np.float32)
+        # 可观测：y1[m], v1[m/s], a1[m/s²], a_{t-1}。车速和接触力不进观测。
+        obs_low = np.array([-1.0, -50.0, -500.0, -1.0], dtype=np.float32)
+        obs_high = np.array([1.0, 50.0, 500.0, 1.0], dtype=np.float32)
         self.observation_space = gym.spaces.Box(obs_low, obs_high, dtype=np.float32)
 
         # 动作空间：归一化后 [-1, 1]，再映射为 ±action_max N
@@ -171,19 +180,10 @@ class ProcsEnv(gym.Env):
         k_end = int(np.searchsorted(positions, total_length - self.skip_spans * span_length, side='right'))
         return math.ceil((k_end - max(1, k_start)) / self.n_inner)
 
-    def _prime_eval_filter(self, burn_hist: dict | None) -> np.ndarray:
-        """用滑行段接触力把评估低通推到稳态，避免稳定段开头的滤波瞬态进 RMSE。"""
-        fc_burn = np.asarray(burn_hist['contact_force'], dtype=np.float64) if burn_hist else np.empty(0)
-        if fc_burn.size:
-            zi = sosfilt_zi(self._eval_sos) * fc_burn[0]
-            _, zi = sosfilt(self._eval_sos, fc_burn, zi=zi)
-            return zi
-        return sosfilt_zi(self._eval_sos) * float(self._core.F0)
-
     def _observation(self) -> np.ndarray:
         # 末维是产生当前观测的上一步归一化动作；reset 时为 0。当前步动作只进评论家。
         plant = self._core.current_observation().astype(np.float32)
-        return np.concatenate([plant, np.array([self._previous_action], dtype=np.float32)])
+        return np.concatenate([plant[:3], np.array([self._previous_action], dtype=np.float32)])
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
@@ -207,10 +207,12 @@ class ProcsEnv(gym.Env):
         else:
             self._core.reset(speed_kmh=speed)
 
-        # 无控制滑行至稳定段起点（启动瞬态不计入训练）；评估时预热统计用低通
+        # 无控制滑行至稳定段起点，启动瞬态不计入训练。慢均值从这段原始接触力起步。
         burn = self._core.k_start - 1
-        burn_hist = self._core.advance(burn, 0.0) if burn > 0 else None
-        self._eval_zi = self._prime_eval_filter(burn_hist) if self.record_eval_trajectory else None
+        coast_fc = np.empty(0)
+        if burn > 0:
+            coast_fc = self._core.advance(burn, 0.0)['contact_force']
+        self._slow_mean = float(coast_fc.mean()) if coast_fc.size else float(self._core.fc)
 
         self._episode_steps = 0
         self._episode_return = 0.0
@@ -236,9 +238,12 @@ class ProcsEnv(gym.Env):
             raise ValueError('action must contain exactly one finite value')
         normalized_action = float(np.clip(action.reshape(-1)[0], -1.0, 1.0))
         f3 = normalized_action * self.action_max
+        noise = 0.0 if self.actuator_noise_std == 0.0 else float(self.np_random.normal(0.0, self.actuator_noise_std))
+        # 每个控制步抽一次噪声，并在该控制周期内保持，和 f3 的零阶保持一致。
+        u = actuator_force(f3, self.actuator_delta, noise)
 
         try:
-            hist = self._core.advance(self.n_inner, f3)
+            hist = self._core.advance(self.n_inner, u)
         except FloatingPointError:
             self._previous_action = normalized_action
             obs = self._observation()
@@ -289,27 +294,22 @@ class ProcsEnv(gym.Env):
         n_actual = int(hist['n_actual'])
         mean_fc = float(fc.mean())
         std_fc = float(fc.std())
-        force_mse = float(np.mean(((fc - target_force) / target_force) ** 2))
-        rel_bias = (mean_fc - target_force) / target_force
-        bias_penalty = BIAS_PENALTY_WEIGHT * rel_bias**2
-        n_loss = int((fc <= 0.0).sum())  # 离线步数
-        n_overforce = int((fc >= MAX_CONTACT_FORCE_N).sum())  # 超过300N的步数
-        loss_fraction = n_loss / n_actual  # 离线比
-        overforce_fraction = n_overforce / n_actual  # 超力比
+        # 原始接触力。e_t 同时含这一步里的波动和偏差。
+        track_error = float(np.mean(((fc - target_force) / target_force) ** 2))
+        n_loss = int((fc <= 0.0).sum())  # 离线步数，只进统计
+        loss_fraction = n_loss / n_actual
+        # 单边接触把力截断在 0。分离深度用弹簧力 KS*间隙，只在为负时按相对深度平方扣。
+        signed = hist['contact_force_signed']
+        loss_penalty = float(np.mean((np.minimum(signed, 0.0) / target_force) ** 2))
         min_fc = float(fc.min())
         max_fc = float(fc.max())
         action_penalty = self.action_penalty_weight * normalized_action**2  # 惩罚动作幅度大
         action_delta = normalized_action - self._previous_action
         action_rate_penalty = self.action_rate_weight * action_delta**2  # 惩罚动作变化太快
+        self._slow_mean = (1.0 - self._slow_beta) * self._slow_mean + self._slow_beta * mean_fc
+        slow_penalty = slow_mean_penalty((self._slow_mean - target_force) / target_force)
 
-        scale = track_scale(self._core.speed_kmh)
-        reward = (
-            -force_mse * scale
-            - bias_penalty * scale
-            - CONSTRAINT_WEIGHT * (loss_fraction + overforce_fraction)
-            - action_penalty
-            - action_rate_penalty
-        )
+        reward = -(track_error + slow_penalty + loss_penalty + action_penalty + action_rate_penalty)
 
         self._previous_action = normalized_action
         obs = self._observation()
@@ -326,14 +326,16 @@ class ProcsEnv(gym.Env):
             'std_Fc_N': std_fc,
             'min_Fc_N': min_fc,
             'max_Fc_N': max_fc,
-            'force_mse': force_mse,
-            'bias_penalty': bias_penalty,
-            'track_scale': scale,
+            'force_mse': track_error,
+            'track_error': track_error,
             'loss_fraction': loss_fraction,
-            'overforce_fraction': overforce_fraction,
+            'loss_penalty': loss_penalty,
+            'slow_mean_N': self._slow_mean,
+            'slow_penalty': slow_penalty,
+            'signed_Fc_N': signed.astype(np.float64, copy=False),
             'n_loss': n_loss,
-            'n_overforce': n_overforce,
             'f3_N': f3,
+            'u_N': u,
             'n_inner_actual': n_actual,
             'target_Fc_N': target_force,
             'action_delta': action_delta,
@@ -345,9 +347,7 @@ class ProcsEnv(gym.Env):
             info['trajectory_time_s'] = hist['time_s']
             info['trajectory_position_m'] = hist['position_m']
             info['trajectory_contact_force_N'] = fc.astype(np.float64, copy=False)
-            fc_filtered, self._eval_zi = sosfilt(self._eval_sos, fc.astype(np.float64, copy=False), zi=self._eval_zi)
-            info['trajectory_contact_force_filtered_N'] = fc_filtered.astype(np.float64, copy=False)
-            info['trajectory_control_force_N'] = np.full(n_actual, f3, dtype=np.float64)
+            info['trajectory_control_force_N'] = np.full(n_actual, u, dtype=np.float64)
         return obs, float(reward), terminated, truncated, info
 
     def render(self) -> None:

@@ -9,7 +9,7 @@ platforms = [
 version = "0.1.0"
 
 [tasks]
-tensorboard = "tensorboard --logdir"
+tensorboard = "tensorboard"
 
 
 [dependencies]

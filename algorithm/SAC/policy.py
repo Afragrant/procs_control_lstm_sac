@@ -122,7 +122,13 @@ class QHead(nn.Module):
 
 
 def _build_representation(representation: str, obs_shape: tuple[int, ...], config, device) -> nn.Module:
-    """按配置构建表示网络。环境为 POMDP：两种表示都以堆叠窗口 (seq_len, obs_dim) 为输入。"""
+    """Basic_MLP 吃单帧 (obs_dim,)。History_* 吃堆叠窗口 (seq_len, obs_dim)。"""
+    if representation == 'Basic_MLP':
+        if len(obs_shape) != 1:
+            raise ValueError(f'Basic_MLP expects (obs_dim,) observation, got {obs_shape}')
+        from algorithm.MLP_SAC import BasicMLP
+
+        return BasicMLP(obs_shape, list(config.representation_hidden_size), config.activation, device)
     if len(obs_shape) != 2:
         raise ValueError(f'representation {representation!r} expects (seq_len, obs_dim) observation, got {obs_shape}')
     if representation == 'History_MLP':
@@ -133,7 +139,7 @@ def _build_representation(representation: str, obs_shape: tuple[int, ...], confi
         from algorithm.LSTM_SAC import HistoryLSTM
 
         return HistoryLSTM(obs_shape, list(config.representation_hidden_size), device=device)
-    raise ValueError(f'unknown representation {representation!r} (expected History_MLP or History_LSTM)')
+    raise ValueError(f'unknown representation {representation!r} (expected Basic_MLP, History_MLP, or History_LSTM)')
 
 
 def build_actor(
@@ -189,6 +195,41 @@ def build_qvalue(
             in_keys=['feat', 'action'],
             out_keys=['state_action_value'],
         ),
+    )
+
+
+def make_deterministic_head(
+    input_dim: int, action_dim: int, hidden_sizes: list[int], activation: str, device=None
+) -> nn.Module:
+    """DDPG actor 头部：隐藏层 + tanh，动作落在 [-1, 1]。"""
+    layers: list[nn.Module] = []
+    in_dim = input_dim
+    for hidden in hidden_sizes:
+        layers += [nn.Linear(in_dim, hidden, device=device), make_activation(activation)]
+        in_dim = hidden
+    layers += [nn.Linear(in_dim, action_dim, device=device), nn.Tanh()]
+    return nn.Sequential(*layers)
+
+
+def build_deterministic_actor(
+    representation: str,
+    obs_shape: tuple[int, ...],
+    action_dim: int,
+    config,
+    device: torch.device,
+    obs_key: str = OBS_NORMED_KEY,
+) -> TensorDictModule:
+    """确定性 actor。评估和 DDPG 目标网络走这条；采集噪声加在外面。"""
+    repr_net = _build_representation(representation, obs_shape, config, device)
+    return TensorDictModule(
+        nn.Sequential(
+            repr_net,
+            make_deterministic_head(
+                repr_net.output_dim, action_dim, list(config.actor_hidden_size), config.activation, device
+            ),
+        ),
+        in_keys=[obs_key],
+        out_keys=['action'],
     )
 
 

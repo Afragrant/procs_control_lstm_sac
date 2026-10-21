@@ -6,12 +6,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, sosfilt, sosfilt_zi
+from scipy.signal import butter, sosfilt, sosfilt_zi, welch
 
 DEFAULT_TIME_COLUMN = 'time_s'
 DEFAULT_FORCE_COLUMN = 'contact_force_N'
 DEFAULT_CUTOFF_HZ = 20.0
 DEFAULT_ORDER = 6
+# Welch 频率分辨率：跨频约 1 Hz，0.25 Hz 足够分开跨频与其谐波
+PSD_DF_HZ = 0.25
 
 
 def filter_contact_force(
@@ -45,6 +47,49 @@ def filter_contact_force(
     sos = butter(int(order), cutoff_hz, fs=fs, output='sos')
     zi = sosfilt_zi(sos) * force_n[0]
     return sosfilt(sos, force_n, zi=zi)[0]
+
+
+def contact_force_psd(
+    time_s: np.ndarray,
+    force_n: np.ndarray,
+    *,
+    fmax_hz: float = DEFAULT_CUTOFF_HZ,
+    df_hz: float = PSD_DF_HZ,
+) -> dict[str, np.ndarray | float]:
+    """One-sided Welch PSD of a uniformly sampled contact-force series.
+
+    去均值后算密度谱；``band_power_N2`` 是 [0, fmax_hz] 的积分，单位 N²，
+    与方差同量纲（Parseval）。传入未滤波接触力，频带由 fmax_hz 截断。
+    """
+    empty: dict[str, np.ndarray | float] = {
+        'freq_Hz': np.empty(0, dtype=np.float64),
+        'psd_N2_Hz': np.empty(0, dtype=np.float64),
+        'band_power_N2': float('nan'),
+    }
+    time_s = np.asarray(time_s, dtype=np.float64)
+    force_n = np.asarray(force_n, dtype=np.float64)
+    if time_s.ndim != 1 or force_n.ndim != 1 or time_s.size != force_n.size or time_s.size < 2:
+        return empty
+    if not np.isfinite(time_s).all() or not np.isfinite(force_n).all():
+        return empty
+    dt = float(time_s[1] - time_s[0])
+    if not np.isfinite(dt) or dt <= 0:
+        return empty
+    if not np.isfinite(fmax_hz) or fmax_hz <= 0 or not np.isfinite(df_hz) or df_hz <= 0:
+        return empty
+    fs = 1.0 / dt
+    nperseg = min(int(force_n.size), max(256, int(round(fs / df_hz))))
+    freq, pxx = welch(force_n - force_n.mean(), fs=fs, nperseg=nperseg, scaling='density')
+    band = (freq >= 0.0) & (freq <= fmax_hz)
+    if not np.any(band):
+        return empty
+    freq_b = np.asarray(freq[band], dtype=np.float64)
+    pxx_b = np.asarray(pxx[band], dtype=np.float64)
+    return {
+        'freq_Hz': freq_b,
+        'psd_N2_Hz': pxx_b,
+        'band_power_N2': float(np.trapezoid(pxx_b, freq_b)),
+    }
 
 
 def contact_force_metrics(time_s: np.ndarray, force_n: np.ndarray) -> dict[str, float]:

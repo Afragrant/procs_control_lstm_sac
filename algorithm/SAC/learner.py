@@ -12,6 +12,13 @@ from .policy import OBS_NORMED_KEY, RunningObsNorm, build_actor, build_qvalue
 LOSS_FUNCTION = 'l2'  # torchrl 的 l2 即 F.mse_loss
 
 
+def resolve_target_entropy(config, action_dim: int) -> float:
+    """配置里写了 target_entropy 就用它，包括 0；没写则用 -action_dim。"""
+    if not hasattr(config, 'target_entropy'):
+        return -float(action_dim)
+    return float(config.target_entropy)
+
+
 class SACLearner:
     """包装 torchrl SACLoss：双 Q 学习、目标网络软更新、自动熵调节。
 
@@ -45,7 +52,7 @@ class SACLearner:
             loss_function=LOSS_FUNCTION,
             alpha_init=float(config.alpha),
             fixed_alpha=not self.use_automatic_entropy_tuning,
-            target_entropy=-float(action_dim),
+            target_entropy=resolve_target_entropy(config, action_dim),
             delay_actor=False,
             delay_qvalue=True,
             deactivate_vmap=self.deactivate_vmap,
@@ -64,9 +71,8 @@ class SACLearner:
             ),
         }
         if self.use_automatic_entropy_tuning:
-            self.optimizer['alpha'] = torch.optim.Adam(
-                [self.loss_module.log_alpha], lr=float(config.learning_rate_actor)
-            )
+            alpha_lr = float(getattr(config, 'learning_rate_alpha', config.learning_rate_actor))
+            self.optimizer['alpha'] = torch.optim.Adam([self.loss_module.log_alpha], lr=alpha_lr)
 
     def _normalize_batch(self, batch: TensorDict) -> TensorDict:
         """用当前统计量把 s 与 s' 归一化到 OBS_NORMED_KEY（同一套统计量，两端一致）。"""

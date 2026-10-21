@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import math
 import os
@@ -9,19 +10,24 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.font_manager import FontProperties
 import numpy as np
 import torch
 from gymnasium.wrappers import FrameStackObservation
 
-from algorithm.PID import PIDController
 from algorithm.SAC import SACAgent
 from env.procs_env import ProcsEnv, parse_history_length
+from utils.env_utils import DEFAULT_CUTOFF_HZ, contact_force_psd
+
+# 主动控制力按 100 Hz 保持，频谱画到控制奈奎斯特频率。
+CONTROL_SPECTRUM_HZ = 50.0
+_CJK = FontProperties(family='Noto Sans CJK SC', size=10)
 
 FINAL_MODEL_NAME = 'final_train_model.pth'
 BEST_MODEL_DIR = 'best'
 BEST_MODEL_NAME = 'best_model.pth'
-# 训练范围设为 speed_range_kmh 时（或测试不带 --speed 时）使用的验证速度点
-EVAL_SPEEDS_KMH = (200.0, 230.0, 250.0)
+# 训练范围设为 speed_range_kmh 时（或测试不带 --speed 时）使用的验证速度点。选模只用落在训练范围内的点。
+EVAL_SPEEDS_KMH = (200.0, 220.0, 240.0, 260.0, 280.0, 300.0)
 EVAL_SEED = 1
 
 # 轨迹 CSV 列定义
@@ -35,12 +41,23 @@ TRAJECTORY_FIELDS = (
     'control_force_N',
     'target_force_N',
 )
+PSD_FIELDS = (
+    'speed_kmh',
+    'policy',
+    'freq_Hz',
+    'spatial_frequency_1_per_m',
+    'psd_N2_Hz',
+    'psd_N2_per_m',
+)
 
 # 波形图策略样式
 POLICY_PLOT_STYLES = {
     'mlp_sac': {'label': 'MLP-SAC', 'color': 'C0'},
+    'sac': {'label': 'SAC', 'color': 'C3'},
+    'ddpg': {'label': 'DDPG', 'color': 'C6'},
     'lstm_sac': {'label': 'LSTM-SAC', 'color': 'C1'},
-    'pid': {'label': 'PID', 'color': 'C3'},
+    'recurrent_sac': {'label': 'Recurrent-SAC', 'color': 'C5'},
+    'greedy_sac': {'label': 'Greedy-SAC', 'color': 'C4'},
     'zero_control': {'label': 'zero control', 'color': 'C2'},
 }
 
@@ -173,6 +190,56 @@ def configure_speed_run(config, speed: float | None = None) -> tuple[dict, str]:
     return env_kwargs, speed_dir
 
 
+def add_robustness_arguments(parser: argparse.ArgumentParser) -> None:
+    """接触线不平顺和作动器衰减。不传则沿用配置，训练默认是理想线路、作动器不衰减。"""
+    parser.add_argument(
+        '--irregularity',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='接触线不平顺开关。只传 --wear-amplitude 时也会打开。',
+    )
+    parser.add_argument(
+        '--WEAR_AMPLITUDE',
+        '--wear-amplitude',
+        dest='wear_amplitude',
+        type=float,
+        default=None,
+        help='不平顺幅值 A_w，单位 m。0.5/1/2 mm 写成 0.0005、0.001、0.002。',
+    )
+    parser.add_argument(
+        '--WEAR_WAVELENGTH',
+        '--wear-wavelength',
+        dest='wear_wavelength',
+        type=float,
+        default=None,
+        help='不平顺波长 λ_w，单位 m。三组实验都是 0.6。',
+    )
+    parser.add_argument(
+        '--actuator-delta',
+        type=float,
+        default=None,
+        help='作动器效能 δ，实际力 u=δ*f3+v。1 表示不衰减。实验用 0.8 和 0.5。',
+    )
+    parser.add_argument(
+        '--actuator-noise-std',
+        type=float,
+        default=None,
+        help='作动器噪声标准差，单位 N。v~N(0, 2²) 写成 2。',
+    )
+    parser.add_argument(
+        '--pantograph',
+        type=int,
+        default=None,
+        help='受电弓型号。1 DSA380，2 DSA250，3 TSG18F，4–7 为 DSA380 磨损变体。默认 1。',
+    )
+    parser.add_argument(
+        '--catenary',
+        type=int,
+        default=None,
+        help='刚性接触网型号 1–3。1 跨距 8 m，2 跨距 8.5 m，3 跨距 8 m。默认 3。',
+    )
+
+
 def configure_irregularity(
     env_kwargs: dict,
     *,
@@ -181,12 +248,59 @@ def configure_irregularity(
     wear_wavelength: float | None = None,
 ) -> dict:
     kwargs = dict(env_kwargs)
+    if wear_amplitude is not None:
+        kwargs['wear_amplitude'] = float(wear_amplitude)
+    if wear_wavelength is not None:
+        kwargs['wear_wavelength'] = float(wear_wavelength)
     if irregularity is not None:
         kwargs['irregularity'] = irregularity
-    if wear_amplitude is not None:
-        kwargs['wear_amplitude'] = wear_amplitude
-    if wear_wavelength is not None:
-        kwargs['wear_wavelength'] = wear_wavelength
+    elif wear_amplitude is not None:
+        kwargs['irregularity'] = True
+    return kwargs
+
+
+def configure_actuator(
+    env_kwargs: dict,
+    *,
+    actuator_delta: float | None = None,
+    actuator_noise_std: float | None = None,
+) -> dict:
+    kwargs = dict(env_kwargs)
+    if actuator_delta is not None:
+        delta = float(actuator_delta)
+        if not math.isfinite(delta) or delta < 0:
+            raise ValueError(f'actuator_delta must be finite and non-negative, got {actuator_delta}')
+        kwargs['actuator_delta'] = delta
+    if actuator_noise_std is not None:
+        std = float(actuator_noise_std)
+        if not math.isfinite(std) or std < 0:
+            raise ValueError(f'actuator_noise_std must be finite and non-negative, got {actuator_noise_std}')
+        kwargs['actuator_noise_std'] = std
+    return kwargs
+
+
+DEFAULT_PANTOGRAPH = 1
+DEFAULT_CATENARY = 3
+
+
+def configure_plant(
+    env_kwargs: dict,
+    *,
+    pantograph: int | None = None,
+    catenary: int | None = None,
+) -> dict:
+    """受电弓和刚性接触网型号。不传则沿用环境默认：弓 1，网 3。"""
+    kwargs = dict(env_kwargs)
+    if pantograph is not None:
+        choice = int(pantograph)
+        if choice < 1 or choice > 7:
+            raise ValueError(f'pantograph must be an integer from 1 to 7, got {pantograph}')
+        kwargs['pantograph'] = choice
+    if catenary is not None:
+        choice = int(catenary)
+        if choice not in (1, 2, 3):
+            raise ValueError(f'catenary must be 1, 2, or 3, got {catenary}')
+        kwargs['rigid_overhead_contact_system'] = choice
     return kwargs
 
 
@@ -224,6 +338,9 @@ def make_periodic_eval_env(env_kwargs: dict, *, history_length: int | None = Non
 
 # 评估用的单回合 rollout 函数
 def run_episode(env, action_fn, seed: int) -> dict:
+    # 每条评估轨迹用自己的循环状态，并在第一帧之前清零。
+    if callable(getattr(action_fn, 'reset_state', None)):
+        action_fn.reset_state()
     obs, info = env.reset(seed=seed)
     rows = []
     trajectory = {
@@ -232,8 +349,7 @@ def run_episode(env, action_fn, seed: int) -> dict:
         'contact_force_N': [],
         'control_force_N': [],
     }
-    n_inner_total = n_loss_total = n_over_total = 0
-    sum_mse = 0.0
+    n_inner_total = n_loss_total = 0
     rewards = []
     f3s = []
     diverged = False
@@ -252,8 +368,6 @@ def run_episode(env, action_fn, seed: int) -> dict:
             _append_trajectory_samples(step_info, trajectory)
             n_inner_total += n_inner
             n_loss_total += int(step_info['n_loss'])
-            n_over_total += int(step_info['n_overforce'])
-            sum_mse += float(step_info['force_mse']) * n_inner
             rows.append(
                 {
                     'step': int(step_info['episode_step']),
@@ -262,16 +376,19 @@ def run_episode(env, action_fn, seed: int) -> dict:
                     'f3_N': float(step_info['f3_N']),
                     'force_mse': float(step_info['force_mse']),
                     'loss_fraction': float(step_info['loss_fraction']),
-                    'overforce_fraction': float(step_info['overforce_fraction']),
                     'reward': float(reward),
                     'episode_return': float(step_info['episode_return']),
                 }
             )
         if terminated or truncated:
             break
-    sample_stats = compute_contact_force_sample_stats(np.asarray(trajectory['contact_force_N'], dtype=np.float64))
-    force_mse = float(sum_mse / n_inner_total) if n_inner_total else float('nan')
+    # 均值、极值、标准差、RMSE、PSD 都用未滤波接触力。
+    fc_samples = np.asarray(trajectory['contact_force_N'], dtype=np.float64)
+    time_samples = np.asarray(trajectory['time_s'], dtype=np.float64)
+    sample_stats = compute_contact_force_sample_stats(fc_samples)
+    psd = contact_force_psd(time_samples, fc_samples)
     target_force = float(info['target_Fc_N'])
+    force_mse = float(np.mean(((fc_samples - target_force) / target_force) ** 2)) if fc_samples.size else float('nan')
     fc_mean = float(sample_stats['fc_mean_N'])
     return {
         'speed_kmh': float(info['speed_kmh']),
@@ -282,10 +399,10 @@ def run_episode(env, action_fn, seed: int) -> dict:
         'fc_min_N': float(sample_stats['fc_min_N']),
         'fc_max_N': float(sample_stats['fc_max_N']),
         'fc_sample_std_N': float(sample_stats['fc_sample_std_N']),
+        'fc_psd_band_N2': float(psd['band_power_N2']),
         'fc_rmse_N': target_force * math.sqrt(force_mse),
         'force_mse': force_mse,
         'loss_fraction': float(n_loss_total / n_inner_total) if n_inner_total else float('nan'),
-        'overforce_fraction': float(n_over_total / n_inner_total) if n_inner_total else float('nan'),
         'f3_rms_N': float(np.sqrt(np.mean(np.square(f3s)))) if f3s else 0.0,
         'n_control_steps': len(rows),
         'n_samples': int(sample_stats['n_samples']),
@@ -297,6 +414,8 @@ def run_episode(env, action_fn, seed: int) -> dict:
 
 
 def agent_action_fn(agent: SACAgent):
+    if callable(getattr(agent, 'eval_action', None)):
+        return agent.eval_action()
     obs_shape = agent.obs_shape
 
     def _fn(obs):
@@ -324,19 +443,15 @@ def episode_status(result: dict) -> str:
 
 
 def print_eval_table(summaries: list[dict], policies: tuple[str, ...]) -> None:
-    print(
-        f'{"speed":>8} {"policy":>12} {"status":>24} {"target":>10} '
-        f'{"mean":>10} {"bias":>10} {"rmse":>10} {"std":>10} {"n_samp":>8}'
-    )
+    print(f'{"speed":>8} {"policy":>12} {"status":>24} {"std":>10} {"psd":>10} {"n_samp":>8}')
     for speed in sorted({float(row['speed_kmh']) for row in summaries}):
         pair = {row['policy']: row for row in summaries if row['speed_kmh'] == speed}
         for policy in policies:
             row = pair[policy]
             print(
                 f'{speed:8.0f} {policy:>12} {episode_status(row):>24} '
-                f'{row["target_Fc_N"]:10.4f} {row["fc_mean_N"]:10.4f} '
-                f'{row["fc_bias_N"]:10.4f} {row["fc_rmse_N"]:10.4f} '
-                f'{row["fc_sample_std_N"]:10.4f} {row["n_samples"]:8d}'
+                f'{row["fc_sample_std_N"]:10.4f} {row["fc_psd_band_N2"]:10.4f} '
+                f'{row["n_samples"]:8d}'
             )
 
 
@@ -349,14 +464,36 @@ def _eval_speed_kwargs(env_kwargs: dict, speed: float) -> dict:
 
 def eval_condition_name(env_kwargs: dict) -> str:
     if not env_kwargs.get('irregularity', False):
-        return 'smooth'
-    return f'irregularity_A{float(env_kwargs["wear_amplitude"]):g}m_L{float(env_kwargs["wear_wavelength"]):g}m'
+        name = 'smooth'
+    else:
+        name = f'irregularity_A{float(env_kwargs["wear_amplitude"]):g}m_L{float(env_kwargs["wear_wavelength"]):g}m'
+    delta = float(env_kwargs.get('actuator_delta', 1.0))
+    noise = float(env_kwargs.get('actuator_noise_std', 0.0))
+    if delta != 1.0 or noise != 0.0:
+        name += f'_delta{delta:g}'
+        if noise != 0.0:
+            name += f'_vstd{noise:g}'
+    pantograph = int(env_kwargs.get('pantograph', DEFAULT_PANTOGRAPH))
+    catenary = int(env_kwargs.get('rigid_overhead_contact_system', DEFAULT_CATENARY))
+    if pantograph != DEFAULT_PANTOGRAPH or catenary != DEFAULT_CATENARY:
+        name += f'_panto{pantograph}_ocs{catenary}'
+    return name
 
 
 def _validation_speeds(env_kwargs: dict) -> tuple[float, ...]:
     if env_kwargs.get('speed_range_kmh') is None and 'speed_kmh' in env_kwargs:
         return (float(env_kwargs['speed_kmh']),)
     return EVAL_SPEEDS_KMH
+
+
+def _model_selection_speeds(env_kwargs: dict, eval_speeds: tuple[float, ...]) -> tuple[float, ...]:
+    """best / 选模只看训练范围内的速度；范围外的评估点仅记录不参与打分。"""
+    speed_range = env_kwargs.get('speed_range_kmh')
+    if not speed_range:
+        return eval_speeds
+    lo, hi = float(speed_range[0]), float(speed_range[1])
+    selected = tuple(s for s in eval_speeds if lo <= s <= hi)
+    return selected or eval_speeds
 
 
 def write_trajectory_csv(
@@ -400,36 +537,45 @@ def write_trajectory_csv(
                     )
 
 
-def plot_contact_force_comparison(
+def _figure_axes(n_speeds: int):
+    fig, axes = plt.subplots(n_speeds, 1, figsize=(10, 3 * n_speeds), sharex=False)
+    if n_speeds == 1:
+        axes = [axes]
+    return fig, axes
+
+
+def plot_force_waveform(
     out_path: Path,
     runs_by_speed: dict[float, dict[str, dict]],
     policies: tuple[str, ...],
+    force_key: str,
+    ylabel: str,
+    *,
+    show_target: bool = False,
 ) -> None:
     speeds = tuple(runs_by_speed)
-    fig, axes = plt.subplots(len(speeds), 1, figsize=(10, 3 * len(speeds)), sharex=False)
-    if len(speeds) == 1:
-        axes = [axes]
+    fig, axes = _figure_axes(len(speeds))
     for axis, speed in zip(axes, speeds, strict=True):
         target_force = None
         for policy in policies:
             result = runs_by_speed[speed][policy]
             trajectory = result['trajectory']
-            if not trajectory['position_m']:
+            if not trajectory['time_s']:
                 continue
             style = POLICY_PLOT_STYLES.get(policy, {'label': policy, 'color': None})
             axis.plot(
-                trajectory['position_m'],
-                trajectory['contact_force_N'],
+                trajectory['time_s'],
+                trajectory[force_key],
                 label=style['label'],
                 color=style['color'],
                 linewidth=0.8,
             )
             target_force = float(result['target_Fc_N'])
-        if target_force is not None:
+        if show_target and target_force is not None:
             axis.axhline(target_force, color='k', linestyle='--', linewidth=1.0, label='target')
         axis.set_title(f'{int(speed)} km/h')
-        axis.set_xlabel('position_m')
-        axis.set_ylabel('contact_force_N')
+        axis.set_xlabel('时间/s', fontproperties=_CJK)
+        axis.set_ylabel(ylabel, fontproperties=_CJK)
         axis.grid(True, alpha=0.3)
         if axis.lines:
             axis.legend(loc='best', fontsize=8)
@@ -438,11 +584,157 @@ def plot_contact_force_comparison(
     plt.close(fig)
 
 
+def write_psd_csv(
+    out_path: Path,
+    runs_by_speed: dict[float, dict[str, dict]],
+    policies: tuple[str, ...],
+    force_key: str,
+    *,
+    fmax_hz: float = DEFAULT_CUTOFF_HZ,
+) -> None:
+    with out_path.open('w', newline='') as fh:
+        writer_csv = csv.DictWriter(fh, fieldnames=PSD_FIELDS)
+        writer_csv.writeheader()
+        for speed in runs_by_speed:
+            speed_mps = float(speed) / 3.6
+            for policy in policies:
+                trajectory = runs_by_speed[speed][policy]['trajectory']
+                time_s = np.asarray(trajectory['time_s'], dtype=np.float64)
+                force_n = np.asarray(trajectory[force_key], dtype=np.float64)
+                psd = contact_force_psd(time_s, force_n, fmax_hz=fmax_hz)
+                freq = np.asarray(psd['freq_Hz'])
+                density = np.asarray(psd['psd_N2_Hz'])
+                if freq.size == 0:
+                    continue
+                for freq_hz, density_hz in zip(freq, density, strict=True):
+                    writer_csv.writerow(
+                        {
+                            'speed_kmh': speed,
+                            'policy': policy,
+                            'freq_Hz': freq_hz,
+                            'spatial_frequency_1_per_m': freq_hz / speed_mps,
+                            'psd_N2_Hz': density_hz,
+                            'psd_N2_per_m': density_hz * speed_mps,
+                        }
+                    )
+
+
+def plot_force_spectrum(
+    out_path: Path,
+    runs_by_speed: dict[float, dict[str, dict]],
+    policies: tuple[str, ...],
+    force_key: str,
+    *,
+    fmax_hz: float = DEFAULT_CUTOFF_HZ,
+) -> None:
+    speeds = tuple(runs_by_speed)
+    fig, axes = _figure_axes(len(speeds))
+    for axis, speed in zip(axes, speeds, strict=True):
+        for policy in policies:
+            trajectory = runs_by_speed[speed][policy]['trajectory']
+            time_s = np.asarray(trajectory['time_s'], dtype=np.float64)
+            force_n = np.asarray(trajectory[force_key], dtype=np.float64)
+            psd = contact_force_psd(time_s, force_n, fmax_hz=fmax_hz)
+            freq = np.asarray(psd['freq_Hz'])
+            density = np.asarray(psd['psd_N2_Hz'])
+            if freq.size == 0:
+                continue
+            style = POLICY_PLOT_STYLES.get(policy, {'label': policy, 'color': None})
+            axis.plot(
+                freq,
+                density,
+                label=style['label'],
+                color=style['color'],
+                linestyle='--' if policy == 'zero_control' else '-',
+                linewidth=1.2,
+            )
+        axis.set_title(f'{int(speed)} km/h')
+        axis.set_xlabel('频率/Hz', fontproperties=_CJK)
+        axis.set_ylabel('功率谱密度/(N²/Hz)', fontproperties=_CJK)
+        axis.set_xlim(0.0, fmax_hz)
+        axis.set_ylim(bottom=0.0)
+        axis.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+        if axis.lines:
+            axis.legend(loc='upper right', fontsize=8, frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_episode_returns(out_path: Path, records: list[tuple[int, float]], window: int = 20) -> None:
+    if not records:
+        return
+    steps = np.asarray([step for step, _ in records], dtype=np.float64)
+    returns = np.asarray([value for _, value in records], dtype=np.float64)
+    fig, axis = plt.subplots(figsize=(8, 4))
+    axis.plot(steps, returns, color='C0', alpha=0.25, linewidth=0.8, label='episode return')
+    if returns.size >= 2:
+        width = min(window, int(returns.size))
+        smooth = np.convolve(returns, np.ones(width) / width, mode='valid')
+        axis.plot(steps[width - 1 :], smooth, color='C0', linewidth=1.8, label=f'mean ({width} episodes)')
+    axis.set_xlabel('training step')
+    axis.set_ylabel('episode return')
+    axis.grid(True, alpha=0.3)
+    axis.legend(loc='best', fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def write_episode_return_log(out_dir: Path, records: list[tuple[int, float]]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / 'episode_return.csv'
+    with csv_path.open('w', newline='') as fh:
+        writer = csv.DictWriter(fh, fieldnames=['step', 'episode_return'])
+        writer.writeheader()
+        for step, value in records:
+            writer.writerow({'step': step, 'episode_return': value})
+    print(f'wrote {csv_path}')
+    plot_path = out_dir / 'episode_return.png'
+    plot_episode_returns(plot_path, records)
+    if records:
+        print(f'wrote {plot_path}')
+
+
+def _write_eval_outputs(out_dir: Path, runs_by_speed: dict[float, dict[str, dict]], policies: tuple[str, ...]) -> None:
+    trajectory_path = out_dir / 'contact_force_trajectory.csv'
+    write_trajectory_csv(trajectory_path, runs_by_speed, policies)
+    print(f'wrote {trajectory_path}')
+    contact_plot = out_dir / 'contact_force_waveform.png'
+    plot_force_waveform(
+        contact_plot,
+        runs_by_speed,
+        policies,
+        'contact_force_N',
+        '接触力/N',
+        show_target=True,
+    )
+    print(f'wrote {contact_plot}')
+    contact_psd_csv = out_dir / 'contact_force_psd.csv'
+    write_psd_csv(contact_psd_csv, runs_by_speed, policies, 'contact_force_N', fmax_hz=DEFAULT_CUTOFF_HZ)
+    print(f'wrote {contact_psd_csv}')
+    contact_psd_plot = out_dir / 'contact_force_psd.png'
+    plot_force_spectrum(
+        contact_psd_plot, runs_by_speed, policies, 'contact_force_N', fmax_hz=DEFAULT_CUTOFF_HZ
+    )
+    print(f'wrote {contact_psd_plot}')
+    control_plot = out_dir / 'control_force_waveform.png'
+    plot_force_waveform(control_plot, runs_by_speed, policies, 'control_force_N', '控制力/N')
+    print(f'wrote {control_plot}')
+    control_psd_csv = out_dir / 'control_force_psd.csv'
+    write_psd_csv(control_psd_csv, runs_by_speed, policies, 'control_force_N', fmax_hz=CONTROL_SPECTRUM_HZ)
+    print(f'wrote {control_psd_csv}')
+    control_psd_plot = out_dir / 'control_force_psd.png'
+    plot_force_spectrum(
+        control_psd_plot, runs_by_speed, policies, 'control_force_N', fmax_hz=CONTROL_SPECTRUM_HZ
+    )
+    print(f'wrote {control_psd_plot}')
+
+
 def _write_eval_csv(
     out_dir: Path,
     runs_by_speed: dict[float, dict[str, dict]],
     policies: tuple[str, ...],
-    writer=None,
 ) -> list[dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / 'control_compare.csv').unlink(missing_ok=True)
@@ -454,24 +746,7 @@ def _write_eval_csv(
         for speed in runs_by_speed
         for policy in policies
     ]
-    if writer is not None:
-        for row in summaries:
-            writer.add_scalar(
-                f'eval/{int(row["speed_kmh"])}/{row["policy"]}/contact_force_std_N',
-                row['fc_sample_std_N'],
-                0,
-            )
-            writer.add_scalar(
-                f'eval/{int(row["speed_kmh"])}/{row["policy"]}/contact_force_rmse_N',
-                row['fc_rmse_N'],
-                0,
-            )
-    trajectory_path = out_dir / 'contact_force_trajectory.csv'
-    write_trajectory_csv(trajectory_path, runs_by_speed, policies)
-    print(f'wrote {trajectory_path}')
-    plot_path = out_dir / 'contact_force_comparison.png'
-    plot_contact_force_comparison(plot_path, runs_by_speed, policies)
-    print(f'wrote {plot_path}')
+    _write_eval_outputs(out_dir, runs_by_speed, policies)
     summary_path = out_dir / 'control_summary.csv'
     summary_fields = [
         'speed_kmh',
@@ -482,6 +757,7 @@ def _write_eval_csv(
         'fc_bias_N',
         'fc_rmse_N',
         'fc_sample_std_N',
+        'fc_psd_band_N2',
         'n_samples',
     ]
     with summary_path.open('w', newline='') as fh:
@@ -498,6 +774,7 @@ def _write_eval_csv(
                     'fc_bias_N': row['fc_bias_N'],
                     'fc_rmse_N': row['fc_rmse_N'],
                     'fc_sample_std_N': row['fc_sample_std_N'],
+                    'fc_psd_band_N2': row['fc_psd_band_N2'],
                     'n_samples': row['n_samples'],
                 }
             )
@@ -506,52 +783,59 @@ def _write_eval_csv(
     return summaries
 
 
+def selection_ratios(result: dict, baseline: dict) -> dict[str, float]:
+    """STD 与 0–20 Hz 带功率相对零控的比值，小于 1 才更好。"""
+
+    def _lower_is_better(policy: float, reference: float) -> float:
+        if reference <= 0.0 or not np.isfinite(policy) or not np.isfinite(reference):
+            return float('inf')
+        return policy / reference
+
+    return {
+        'std': _lower_is_better(float(result['fc_sample_std_N']), float(baseline['fc_sample_std_N'])),
+        'psd': _lower_is_better(float(result['fc_psd_band_N2']), float(baseline['fc_psd_band_N2'])),
+    }
+
+
 def is_valid_periodic_eval_result(result: dict) -> bool:
     if result.get('diverged', False):
         return False
     if int(result.get('n_samples', 0)) < 2:
         return False
-    return bool(np.isfinite(result['fc_rmse_N']))
+    keys = ('fc_min_N', 'fc_max_N', 'fc_mean_N', 'fc_sample_std_N', 'fc_psd_band_N2', 'target_Fc_N')
+    return all(np.isfinite(result[key]) for key in keys)
 
 
 def compute_best_score(speed_results: dict[float, dict], baseline_results: dict[float, dict]) -> float:
     ratios = [
-        max(
-            float(result['fc_rmse_N']) / float(baseline_results[speed]['fc_rmse_N']),
-            float(result['fc_sample_std_N']) / float(baseline_results[speed]['fc_sample_std_N']),
-        )
+        ratio
         for speed, result in speed_results.items()
+        for ratio in selection_ratios(result, baseline_results[speed]).values()
     ]
-    if not all(np.isfinite(ratio) for ratio in ratios):
+    if not ratios or not all(np.isfinite(ratio) for ratio in ratios):
         return float('nan')
     return float(np.mean(ratios))
 
 
-def _log_periodic_eval(
-    agent: SACAgent,
-    speed_results: dict[float, dict],
-    baseline_results: dict[float, dict],
+def is_best_checkpoint_eligible(
     score: float,
-    step: int,
-) -> None:
-    writer = getattr(agent, 'writer', None)
-    if writer is None:
-        return
-    for speed, result in speed_results.items():
-        writer.add_scalar(f'periodic_eval/{int(speed)}/contact_force_std_N', result['fc_sample_std_N'], step)
-        writer.add_scalar(f'periodic_eval/{int(speed)}/contact_force_rmse_N', result['fc_rmse_N'], step)
-        writer.add_scalar(
-            f'periodic_eval/{int(speed)}/zero_control_std_N', baseline_results[speed]['fc_sample_std_N'], step
-        )
-        writer.add_scalar(f'periodic_eval/{int(speed)}/zero_control_rmse_N', baseline_results[speed]['fc_rmse_N'], step)
-    if np.isfinite(score):
-        writer.add_scalar('periodic_eval/mean_joint_ratio', score, step)
-
-
-def _log_best_score(agent: SACAgent, score: float, step: int) -> None:
-    writer = getattr(agent, 'writer', None)
-    if writer is not None and np.isfinite(score):
-        writer.add_scalar('periodic_eval/best_joint_ratio', score, step)
+    *,
+    speed_results: dict[float, dict] | None = None,
+    baseline_results: dict[float, dict] | None = None,
+    selection_speeds: tuple[float, ...] | None = None,
+) -> bool:
+    """每个入选速度上，接触力 STD 和 0–20 Hz PSD 带功率都要严格好于零控。"""
+    if not selection_speeds:
+        return bool(np.isfinite(score) and score < 1.0)
+    if speed_results is None or baseline_results is None:
+        return False
+    for speed in selection_speeds:
+        if speed not in speed_results or speed not in baseline_results:
+            return False
+        ratios = selection_ratios(speed_results[speed], baseline_results[speed])
+        if not all(np.isfinite(ratio) and ratio < 1.0 for ratio in ratios.values()):
+            return False
+    return True
 
 
 def periodic_evaluate(
@@ -559,7 +843,7 @@ def periodic_evaluate(
     env_kwargs: dict,
     *,
     history_length: int | None = None,
-) -> tuple[dict[float, dict], dict[float, dict], float, bool]:
+) -> tuple[dict[float, dict], dict[float, dict], float, bool, tuple[float, ...]]:
     speed_results: dict[float, dict] = {}
     baseline_results: dict[float, dict] = {}
     eval_speeds = _validation_speeds(env_kwargs)
@@ -576,15 +860,19 @@ def periodic_evaluate(
         is_valid_periodic_eval_result(speed_results[speed]) and is_valid_periodic_eval_result(baseline_results[speed])
         for speed in eval_speeds
     )
-    score = compute_best_score(speed_results, baseline_results) if valid else float('nan')
-    eligible = valid and all(
-        speed_results[speed]['fc_rmse_N'] < baseline_results[speed]['fc_rmse_N']
-        and speed_results[speed]['fc_sample_std_N'] < baseline_results[speed]['fc_sample_std_N']
-        for speed in eval_speeds
+    selection_speeds = _model_selection_speeds(env_kwargs, eval_speeds)
+    score = (
+        compute_best_score({speed: speed_results[speed] for speed in selection_speeds}, baseline_results)
+        if valid
+        else float('nan')
     )
-    step = int(getattr(agent, 'current_step', 0))
-    _log_periodic_eval(agent, speed_results, baseline_results, score, step)
-    return speed_results, baseline_results, score, eligible
+    eligible = valid and is_best_checkpoint_eligible(
+        score,
+        speed_results=speed_results,
+        baseline_results=baseline_results,
+        selection_speeds=selection_speeds,
+    )
+    return speed_results, baseline_results, score, eligible, selection_speeds
 
 
 def _find_train_info_value(train_info: dict, key: str) -> tuple[bool, float]:
@@ -625,6 +913,7 @@ def _print_periodic_eval(
     baseline_results: dict[float, dict],
     score: float,
     eligible: bool,
+    selection_speeds: tuple[float, ...] | None = None,
 ) -> None:
     print(f'periodic eval at step {step}:')
     for speed, result in speed_results.items():
@@ -632,11 +921,17 @@ def _print_periodic_eval(
         baseline = baseline_results[speed]
         print(
             f'  {int(speed):>3} km/h status={status:>24} '
-            f'rmse={result["fc_rmse_N"]:.4f} std={result["fc_sample_std_N"]:.4f} '
-            f'zero_rmse={baseline["fc_rmse_N"]:.4f} zero_std={baseline["fc_sample_std_N"]:.4f} '
+            f'std={result["fc_sample_std_N"]:.4f} psd={result["fc_psd_band_N2"]:.4f} '
+            f'zero_std={baseline["fc_sample_std_N"]:.4f} zero_psd={baseline["fc_psd_band_N2"]:.4f} '
             f'n_samples={result["n_samples"]}'
         )
-    print(f'  mean joint ratio={score:.4f} eligible={eligible} (requires RMSE and std below zero control)')
+    speeds = ''
+    if selection_speeds:
+        speeds = ' over ' + '/'.join(f'{int(speed)}' for speed in selection_speeds) + ' km/h'
+    print(
+        f'  selection score={score:.4f} eligible={eligible} '
+        f'(best: std and 0-20 Hz psd each beat zero control{speeds})'
+    )
 
 
 def evaluate_sac(
@@ -665,7 +960,7 @@ def evaluate_sac(
         finally:
             eval_env.close()
 
-    summaries = _write_eval_csv(out_dir, runs_by_speed, (policy_name, 'zero_control'), writer=agent.writer)
+    summaries = _write_eval_csv(out_dir, runs_by_speed, (policy_name, 'zero_control'))
     overall = {policy_name: [], 'zero_control': []}
     for row in summaries:
         overall[row['policy']].append(row)
@@ -676,46 +971,21 @@ def evaluate_sac(
     no_divergence = all(
         not row.get('diverged', False) for row in summaries if row['policy'] in (policy_name, 'zero_control')
     )
-    controlled_rmse = _mean('fc_rmse_N', policy_name)
-    baseline_rmse = _mean('fc_rmse_N', 'zero_control')
-    effective = no_divergence and controlled_rmse < baseline_rmse
+    controlled_std = _mean('fc_sample_std_N', policy_name)
+    baseline_std = _mean('fc_sample_std_N', 'zero_control')
+    controlled_psd = _mean('fc_psd_band_N2', policy_name)
+    baseline_psd = _mean('fc_psd_band_N2', 'zero_control')
+    effective = no_divergence and controlled_std < baseline_std and controlled_psd < baseline_psd
     print(
-        f'overall rmse {controlled_rmse:.4f} vs {baseline_rmse:.4f} '
-        f'({pct_improve(baseline_rmse, controlled_rmse):.2f}% improvement)'
+        f'overall std {controlled_std:.4f} vs {baseline_std:.4f} '
+        f'({pct_improve(baseline_std, controlled_std):.2f}% improvement)'
     )
-    print(f'effective control: {effective} (criterion: no divergence and lower contact-force RMSE)')
+    print(
+        f'overall psd {controlled_psd:.4f} vs {baseline_psd:.4f} '
+        f'({pct_improve(baseline_psd, controlled_psd):.2f}% improvement)'
+    )
+    print(f'effective control: {effective} (criterion: no divergence, lower STD and lower 0-20 Hz PSD)')
     return summaries
-
-
-def evaluate_pid(
-    env_kwargs: dict,
-    out_dir: Path,
-    *,
-    kp: float,
-    ki: float,
-    kd: float,
-    seed: int = EVAL_SEED,
-) -> list[dict]:
-    action_max = float(env_kwargs.get('action_max', 100.0))
-    control_freq = float(env_kwargs.get('control_freq', 100.0))
-    runs_by_speed: dict[float, dict[str, dict]] = {}
-    for speed in _validation_speeds(env_kwargs):
-        kwargs = _eval_speed_kwargs(env_kwargs, speed)
-        eval_env = make_eval_env(kwargs)
-        controller = PIDController(kp, ki, kd, 1.0 / control_freq, action_max)
-        target = ProcsEnv.target_contact_force(speed)
-        try:
-            runs_by_speed[speed] = {
-                'pid': run_episode(
-                    eval_env,
-                    lambda obs: np.array([controller.update(target, float(obs[4])) / action_max], dtype=np.float32),
-                    seed=seed,
-                ),
-                'zero_control': run_episode(eval_env, lambda _obs: np.zeros(1, dtype=np.float32), seed=seed),
-            }
-        finally:
-            eval_env.close()
-    return _write_eval_csv(out_dir, runs_by_speed, ('pid', 'zero_control'))
 
 
 def evaluate_lstm_sac(
@@ -750,12 +1020,7 @@ def evaluate_lstm_sac(
             runs['zero_control'] = run_episode(lstm_env, lambda _obs: np.zeros(1, dtype=np.float32), seed=seed)
             runs_by_speed[speed] = runs
 
-    summaries = _write_eval_csv(
-        out_dir,
-        runs_by_speed,
-        policies,
-        writer=lstm_agent.writer,
-    )
+    summaries = _write_eval_csv(out_dir, runs_by_speed, policies)
     short_name = policy_name.removesuffix('_sac') or policy_name
     for speed in runs_by_speed:
         pair = {row['policy']: row for row in summaries if row['speed_kmh'] == speed}
@@ -764,10 +1029,11 @@ def evaluate_lstm_sac(
             print(f'{speed:8.0f} {f"{short_name} vs zero":>12} comparison invalid (diverged: {", ".join(diverged)})')
             continue
         stacked, base = pair[policy_name], pair['zero_control']
-        rmse_p = pct_improve(base['fc_rmse_N'], stacked['fc_rmse_N'])
         std_p = pct_improve(base['fc_sample_std_N'], stacked['fc_sample_std_N'])
+        psd_p = pct_improve(base['fc_psd_band_N2'], stacked['fc_psd_band_N2'])
         print(
-            f'{speed:8.0f} {f"{short_name} vs zero":>12} rmse improvement {rmse_p:10.2f}% (std improvement {std_p:.2f}%)'
+            f'{speed:8.0f} {f"{short_name} vs zero":>12} '
+            f'std improvement {std_p:10.2f}%  psd improvement {psd_p:10.2f}%'
         )
     return summaries
 
@@ -853,23 +1119,21 @@ def train_sac_agent(
             any_update = True
         trained_transitions += segment_transitions
 
-        speed_results, baseline_results, score, eligible = periodic_evaluate(
+        speed_results, baseline_results, score, eligible, selection_speeds = periodic_evaluate(
             agent, env_kwargs, history_length=history_length
         )
-        _print_periodic_eval(int(agent.current_step), speed_results, baseline_results, score, eligible)
+        _print_periodic_eval(
+            int(agent.current_step), speed_results, baseline_results, score, eligible, selection_speeds
+        )
         if any_update and eligible and score < best_score:
             best_score = score
             best_step = int(agent.current_step)
             best_per_speed = {
-                speed: max(
-                    float(result['fc_rmse_N']) / float(baseline_results[speed]['fc_rmse_N']),
-                    float(result['fc_sample_std_N']) / float(baseline_results[speed]['fc_sample_std_N']),
-                )
+                speed: max(selection_ratios(result, baseline_results[speed]).values())
                 for speed, result in speed_results.items()
             }
             best_model_path = _save_best_checkpoint(agent)
-            _log_best_score(agent, best_score, best_step)
-            print(f'new best mean joint ratio {best_score:.4f} at step {best_step}, saved {best_model_path}')
+            print(f'new best selection score {best_score:.4f} at step {best_step}, saved {best_model_path}')
 
     if not any_update:
         raise RuntimeError('no gradient update occurred during training')
@@ -877,13 +1141,14 @@ def train_sac_agent(
     agent.save_model(FINAL_MODEL_NAME)
     final_model_path = os.path.join(agent.model_dir_save, FINAL_MODEL_NAME)
     print(f'saved {final_model_path}')
+    write_episode_return_log(Path(agent.writer.log_dir), agent.episode_return_log)
     agent.load_model(agent.model_dir_save, FINAL_MODEL_NAME)
     finite_action_check(agent)
 
     if best_step is not None and best_model_path is not None:
-        print(f'best checkpoint step={best_step} mean_joint_ratio={best_score:.4f} path={best_model_path}')
+        print(f'best checkpoint step={best_step} selection_score={best_score:.4f} path={best_model_path}')
         for speed, ratio in best_per_speed.items():
-            print(f'  {int(speed)} km/h worst_rmse_or_std_ratio={ratio:.4f}')
+            print(f'  {int(speed)} km/h worst_selection_ratio={ratio:.4f}')
     else:
         print('no eligible best checkpoint saved during training')
 
@@ -921,8 +1186,14 @@ def load_path(model: str) -> tuple[str, str | None]:
         return _resolve_seed_dir(path)
 
     seed_children = sorted(p for p in path.iterdir() if p.is_dir() and p.name.startswith('seed_'))
-    if seed_children:
-        return _resolve_seed_dir(seed_children[-1])
+    if len(seed_children) == 1:
+        return _resolve_seed_dir(seed_children[0])
+    if len(seed_children) > 1:
+        # 多个 seed 时默默挑一个是读结果的常见坑：要求显式给出 seed_* 目录
+        raise ValueError(
+            f'multiple seed_* directories under {path}: '
+            f'{", ".join(p.name for p in seed_children)}; pass the explicit seed_* directory'
+        )
 
     final_path = path / FINAL_MODEL_NAME
     if final_path.is_file():

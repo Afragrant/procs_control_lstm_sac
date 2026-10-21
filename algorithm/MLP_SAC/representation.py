@@ -1,4 +1,4 @@
-"""History-window MLP representation for MLP-SAC (POMDP 帧堆叠 + 展平 MLP 编码器)."""
+"""MLP 表示：BasicMLP 吃单帧，HistoryMLP 吃堆叠窗口。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,44 @@ from torch import Tensor, nn
 from algorithm.SAC.policy import make_activation
 
 DEFAULT_MLP_HIDDEN = 256
+
+
+class BasicMLP(nn.Module):
+    """把单帧观测 [..., obs_dim] 编成向量。没有时间维。"""
+
+    def __init__(
+        self,
+        input_shape: Sequence[int],
+        hidden_sizes: Sequence[int] | None = None,
+        activation: str = 'relu',
+        device: str | int | torch.device | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        if len(input_shape) != 1:
+            raise ValueError(f'BasicMLP expects input_shape (obs_dim,), got {tuple(input_shape)}')
+        obs_dim = int(input_shape[0])
+        if obs_dim <= 0:
+            raise ValueError(f'BasicMLP expects a positive obs_dim, got {obs_dim}')
+
+        hidden_sizes = tuple(hidden_sizes) if hidden_sizes else (DEFAULT_MLP_HIDDEN,)
+        self.obs_dim = obs_dim
+        self.output_dim = int(hidden_sizes[-1])
+
+        layers: list[nn.Module] = []
+        in_dim = obs_dim
+        for hidden in hidden_sizes:
+            layers += [nn.Linear(in_dim, hidden, device=device), make_activation(activation)]
+            in_dim = hidden
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, observations: Tensor) -> Tensor:
+        x = torch.as_tensor(observations, dtype=torch.float32)
+        if x.shape[-1] != self.obs_dim:
+            raise ValueError(f'BasicMLP expects trailing dim {self.obs_dim}, got {tuple(x.shape)}')
+        # SACLoss 的 vmap 会在前面加集成维，压进 batch
+        lead_shape = x.shape[:-1]
+        return self.model(x.reshape(-1, self.obs_dim)).reshape(*lead_shape, self.output_dim)
 
 
 class HistoryMLP(nn.Module):

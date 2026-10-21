@@ -9,7 +9,7 @@ PANTOGRAPH = 1  # 1 = DSA380; 2 = DSA250; 3 = TSG18F
 RIGID_OVERHEAD_CONTACT_SYSTEM = 3
 SPEED_KMH = 200  # [km/h]
 NM = 200
-DT_BASE = 1e-4  # [s]
+DT_BASE = 1e-4  # [s]，积分步长；控制周期由 control_freq 决定
 G = 9.8  # [m/s²]
 
 # KS 为受电弓–接触网之间的接触弹簧刚度
@@ -49,12 +49,17 @@ def _require_int(name: str, value, minimum: int) -> int:
     return int(value)
 
 
+def actuator_force(command_n: float, delta: float = 1.0, noise_n: float = 0.0) -> float:
+    """实际作动力 u = δ f3 + v。δ=1 且 v=0 时等于控制器输出。"""
+    return float(delta) * float(command_n) + float(noise_n)
+
+
 def contact_wire_wear(
     x,
     A_w: float = WEAR_AMPLITUDE,
     lambda_w: float = WEAR_WAVELENGTH,
 ):
-    """接触线磨耗深度 W_cw = A_w/2 · (1 - cos(2πl/λ_w))。"""
+    """接触线不平顺 w_c = A_w/2 · (1 - cos(2πx/λ_w))。"""
     if not np.isfinite(A_w) or A_w < 0:
         raise ValueError(f'A_w must be finite and non-negative, got {A_w}')
     if not np.isfinite(lambda_w) or lambda_w <= 0:
@@ -92,6 +97,10 @@ def pantograph_params(ptype: int, scale: dict[str, float] | None = None):
         1: (7.12, 6.00, 5.80, 9430.0, 14100.0, 0.1, 0, 0, 70.0),  # DSA380
         2: (7.51, 5.855, 4.645, 8380.0, 6200.0, 80.0, 0, 0, 70),  # DSA250
         3: (10.31, 6.15, 15.30, 53415.8, 6754.2, 40687.0, 29.60, 0.20, 1.14),  # TSG18F
+        4: (6.67, 6.30, 5.51, 9430.0, 14100.0, 0.1, 0, 0, 70.0),  # DSA380 质量磨损
+        5: (7.12, 6.00, 5.80, 9901.0, 13395.0, 0.1, 0, 0, 70.0),  # DSA380 刚度磨耗
+        6: (7.12, 6.00, 5.80, 9430.0, 14100.0, 0.1, 0.5, 2.0, 73.5),  # DSA380 阻尼磨耗
+        7: (6.67, 6.30, 5.51, 9901.0, 13395.0, 0.1, 0.5, 2.0, 73.5),  # DSA380 扰动参数
     }
     if ptype not in table:
         raise ValueError(f'PANTOGRAPH must be 1-3, the current value is {ptype}')
@@ -365,7 +374,7 @@ class ProcsCore:
         return self.norm_factor * np.sin(self.modes * np.pi * x / self.LS)
 
     def current_observation(self) -> np.ndarray:
-        """返回当前步观测 [y1, v1, a1, v_train, Fc]。"""
+        """仿真量 [y1, v1, a1, v_train, Fc]。v_train 和 Fc 不进入环境观测。"""
         return np.array(
             [self.Y[0], self.V[0], self.A[0], self.v, self.fc],
             dtype=np.float64,
@@ -393,13 +402,14 @@ class ProcsCore:
 
         k0 = self.k
         contact_force = np.empty(n_inner)
+        signed_force = np.empty(n_inner)
         y_pantograph = np.empty(n_inner)
         y_ocs = np.empty(n_inner)
 
         for i in range(n_inner):
             if self.k >= self.k_end:
                 # 到达终点，截断返回
-                return self._history_slice(k0, i, contact_force, y_pantograph, y_ocs)
+                return self._history_slice(k0, i, contact_force, signed_force, y_pantograph, y_ocs)
 
             xc = self.x_vec[self.k]
             phi = self.phi_at(xc)
@@ -450,28 +460,32 @@ class ProcsCore:
             self.Y = Y_new
 
             rel = contact_penetration(self.Y[0], u_c_new, w_cw)
-            fc = KS * rel if rel > 0 else 0.0
+            signed = KS * rel
+            fc = max(0.0, signed)
             self.fc = fc
 
             contact_force[i] = fc
+            signed_force[i] = signed
             y_pantograph[i] = self.Y[0]
             y_ocs[i] = u_c_new
 
             self.k += 1
 
-        return self._history_slice(k0, n_inner, contact_force, y_pantograph, y_ocs)
+        return self._history_slice(k0, n_inner, contact_force, signed_force, y_pantograph, y_ocs)
 
     def _history_slice(
         self,
         k0: int,
         n_actual: int,
         contact_force: np.ndarray,
+        signed_force: np.ndarray,
         y_pantograph: np.ndarray,
         y_ocs: np.ndarray,
     ) -> dict:
         return {
             'n_actual': n_actual,
             'contact_force': contact_force[:n_actual],
+            'contact_force_signed': signed_force[:n_actual],
             'y_pantograph': y_pantograph[:n_actual],
             'y_ocs': y_ocs[:n_actual],
             'time_s': self.t_vec[k0 : k0 + n_actual].copy(),
@@ -482,6 +496,7 @@ class ProcsCore:
         return {
             'n_actual': 0,
             'contact_force': np.empty(0),
+            'contact_force_signed': np.empty(0),
             'y_pantograph': np.empty(0),
             'y_ocs': np.empty(0),
             'time_s': np.empty(0),

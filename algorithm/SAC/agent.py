@@ -45,7 +45,7 @@ class SACAgent:
             enabled=bool(getattr(config, 'use_obsnorm', True)),
         ).to(self.device)
 
-        self.learner = SACLearner(config, self.obs_shape, self.action_dim, self.device, obs_norm=self.obs_norm)
+        self.learner = self._make_learner()
         self.policy = self.learner.actor
         self.collector_policy = TensorDictSequential(
             build_obs_norm_layer(self.obs_norm),
@@ -60,11 +60,16 @@ class SACAgent:
         self._collector_iter = None
         self.current_step = 0
         self._vec_steps = 0
+        self._episode_return = np.zeros(self.num_envs, dtype=np.float64)
+        self.episode_return_log: list[tuple[int, float]] = []
 
         log_dir = Path(str(config.log_dir)) / f'seed_{getattr(config, "seed", 0)}'
         log_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=str(log_dir))
         self.model_dir_save = str(Path(str(config.model_dir)) / f'seed_{getattr(config, "seed", 0)}')
+
+    def _make_learner(self):
+        return SACLearner(self.config, self.obs_shape, self.action_dim, self.device, obs_norm=self.obs_norm)
 
     # 采集与训练
     def _build_collector(self) -> None:
@@ -98,6 +103,7 @@ class SACAgent:
             collected_vec_steps += 1
             self.current_step += data.numel()
             self._vec_steps += 1
+            self._record_episode_returns(data)
 
             # buffer 存原始观测
             # 重新归一化 s 与 s'
@@ -111,6 +117,21 @@ class SACAgent:
                     for key, value in info.items():
                         self.writer.add_scalar(f'train/{key}', value, self.current_step)
         return info
+
+    def _record_episode_returns(self, data) -> None:
+        nxt = data['next']
+        reward = np.asarray(nxt['reward'].detach().cpu().reshape(self.num_envs, -1)[:, 0], dtype=np.float64)
+        terminated = nxt['terminated'].reshape(self.num_envs, -1)[:, 0]
+        truncated = nxt['truncated'].reshape(self.num_envs, -1)[:, 0]
+        done = np.asarray((terminated | truncated).detach().cpu(), dtype=bool)
+        self._episode_return += reward
+        if not done.any():
+            return
+        completed = self._episode_return[done]
+        self.writer.add_scalar('train/episode_return', float(completed.mean()), self.current_step)
+        for value in completed:
+            self.episode_return_log.append((int(self.current_step), float(value)))
+        self._episode_return[done] = 0.0
 
     # 推理接口（评估用）
     @torch.no_grad()

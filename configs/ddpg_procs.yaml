@@ -1,0 +1,50 @@
+env_seed: 1
+vectorize: "SubprocVecEnv"
+representation: "Basic_MLP"
+
+env_kwargs:
+  speed_kmh: 220.0
+  # 每回合在 [220, 280] km/h 均匀采样。评估 220/240/260/280。
+  speed_range_kmh: [220.0, 280.0]
+  dt_base: 1.0e-4
+  control_freq: 100.0
+  action_max: 50.0
+  action_rate_weight: 0.01
+  action_penalty_weight: 0.001
+  wear_amplitude: 0.001
+  wear_wavelength: 0.6
+  irregularity: false
+  # 0：不堆叠帧。观测是当前 y1, v1, a1, a_{t-1}。
+  history_length: 0
+
+representation_hidden_size: [256]
+actor_hidden_size: [256]
+critic_hidden_size: [256]
+activation: "relu"
+
+seed: 1
+parallels: 4
+buffer_size: 200000
+batch_size: 128
+learning_rate_actor: 0.0003
+learning_rate_critic: 0.0003
+gamma: 0.995
+tau: 0.005
+# 只加在采集动作上，标准差相对 [-1, 1]。评估走确定性策略。
+exploration_noise: 0.1
+
+training_frequency: 8
+running_steps: 500000
+start_training: 5000
+n_epochs: 1
+
+use_grad_clip: True
+grad_clip_norm: 0.5
+use_obsnorm: True
+obsnorm_range: 5
+
+device: "cuda:0"
+test_mode: False
+eval_interval: 25000
+log_dir: "logs/ddpg/"
+model_dir: "models/ddpg/"
