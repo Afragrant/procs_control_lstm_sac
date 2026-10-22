@@ -38,9 +38,10 @@ class RecurrentSACAgent:
             getattr(config, 'obsnorm_range', 5.0),
             enabled=bool(getattr(config, 'use_obsnorm', True)),
         ).to(self.device)
-        self.learner = RecurrentSACLearner(config, self.obs_dim, self.action_dim, self.device, self.obs_norm)
+        self.learner = self._make_learner()
         self.policy = self.learner.actor
         self.hidden_size = self.policy.encoder.hidden_size
+        self.num_layers = self.policy.encoder.num_layers
         self.replay = TrajectoryBuffer(int(config.buffer_size), int(config.sequence_length))
         self.current_step = 0
         self._vec_steps = 0
@@ -53,6 +54,9 @@ class RecurrentSACAgent:
         log_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=str(log_dir))
         self.model_dir_save = str(Path(str(config.model_dir)) / f'seed_{getattr(config, "seed", 0)}')
+
+    def _make_learner(self):
+        return RecurrentSACLearner(self.config, self.obs_dim, self.action_dim, self.device, self.obs_norm)
 
     def train(self, vec_steps: int) -> dict[str, float]:
         if self.test_mode:
@@ -74,15 +78,20 @@ class RecurrentSACAgent:
                     self.writer.add_scalar('train/policy_loss', info['Ploss'], self.current_step)
                     self.writer.add_scalar('train/q_loss', info['Qloss'], self.current_step)
                     self.writer.add_scalar('train/entropy', info['entropy'], self.current_step)
+                    if 'proposal_loss' in info:
+                        self.writer.add_scalar('train/proposal_loss', info['proposal_loss'], self.current_step)
                     if 'alpha' in info:
                         self.writer.add_scalar('train/alpha', info['alpha'], self.current_step)
         return info
+
+    def _zero_state(self, batch: int):
+        return zero_state(batch, self.hidden_size, self.device, num_layers=self.num_layers)
 
     def _ensure_started(self) -> None:
         if self._td is not None:
             return
         self._td = self.envs.reset()
-        self._actor_state = zero_state(self.num_envs, self.hidden_size, self.device)
+        self._actor_state = self._zero_state(self.num_envs)
         self.replay.start(self.num_envs)
 
     @torch.no_grad()
@@ -103,10 +112,14 @@ class RecurrentSACAgent:
         self._td.set('action', action.detach().to(device=self._td.device, dtype=torch.float32))
         transition, self._td = self.envs.step_and_maybe_reset(self._td)
         warmup = int(getattr(self.config, 'start_training', 0))
-        if warmup <= 0 or self.current_step < warmup:
+        warming = warmup <= 0 or self.current_step < warmup
+        if warming:
             self.obs_norm.update(transition['observation'])
         self._store_transition(transition)
         self._record_episode_returns(transition)
+        # 统计量变过之后，在线 (h, c) 仍按旧归一化累加。存完这一帧再重放，下一步才和回放一致。
+        if warming and self.obs_norm.enabled:
+            self._refresh_actor_state()
         # 环境 reset 之后、下一帧进入 actor 之前清零。采集 batch 结束不清。
         done = self._done_mask(transition)
         self._actor_state = reset_env_slots(self._actor_state, done)
@@ -167,16 +180,16 @@ class RecurrentSACAgent:
         if obs.ndim == len(self.obs_shape):
             obs = obs.unsqueeze(0)
         if state is None:
-            state = zero_state(obs.shape[0], self.hidden_size, self.device)
+            state = self._zero_state(obs.shape[0])
         action, next_state = self.act(obs, state, deterministic=test_mode)
         return {'actions': action.detach().cpu().numpy(), 'state': next_state}
 
     def eval_action(self):
         """评估用的独立状态。和采集状态不是同一份。"""
-        holder = {'state': zero_state(1, self.hidden_size, self.device)}
+        holder = {'state': self._zero_state(1)}
 
         def reset_state():
-            holder['state'] = zero_state(1, self.hidden_size, self.device)
+            holder['state'] = self._zero_state(1)
 
         def _fn(obs):
             result = self.get_actions(obs, test_mode=True, state=holder['state'])

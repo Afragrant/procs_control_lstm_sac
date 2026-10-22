@@ -14,7 +14,7 @@ env_kwargs:
   wear_amplitude: 0.001
   wear_wavelength: 0.6
   irregularity: false
-  # 0：不堆叠帧。观测是当前 y1, v1, a1, a_{t-1}。
+  # 0：不堆叠帧。观测是当前 y1, v1, a1, v_train, a_{t-1}。
   history_length: 0
 
 representation_hidden_size: [256]
@@ -28,7 +28,7 @@ buffer_size: 200000
 batch_size: 128
 learning_rate_actor: 0.0003
 learning_rate_critic: 0.0003
-gamma: 0.995
+gamma: 0.99
 tau: 0.005
 # 只加在采集动作上，标准差相对 [-1, 1]。评估走确定性策略。
 exploration_noise: 0.1
@@ -39,7 +39,7 @@ start_training: 5000
 n_epochs: 1
 
 use_grad_clip: True
-grad_clip_norm: 0.5
+grad_clip_norm: 0.2
 use_obsnorm: True
 obsnorm_range: 5
 

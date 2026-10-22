@@ -374,7 +374,7 @@ class ProcsCore:
         return self.norm_factor * np.sin(self.modes * np.pi * x / self.LS)
 
     def current_observation(self) -> np.ndarray:
-        """仿真量 [y1, v1, a1, v_train, Fc]。v_train 和 Fc 不进入环境观测。"""
+        """仿真量 [y1, v1, a1, v_train, Fc]。环境观测取前四项再拼上一拍动作，Fc 不进入观测。"""
         return np.array(
             [self.Y[0], self.V[0], self.A[0], self.v, self.fc],
             dtype=np.float64,

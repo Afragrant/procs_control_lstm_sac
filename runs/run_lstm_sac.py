@@ -54,7 +54,7 @@ def require_history_length(config) -> int:
 def observation_shape(history_length: int) -> tuple[int, ...]:
     if history_length <= 0:
         raise ValueError(f'history_length must be positive, got {history_length}')
-    return (history_length, 4)
+    return (history_length, 5)
 
 
 def run(
@@ -148,7 +148,7 @@ def run(
                 sac_history_length = require_history_length(sac_config)
                 sac_envs = make_envs(sac_config)
                 try:
-                    assert_spaces(sac_envs, obs_shape=(sac_history_length, 4))
+                    assert_spaces(sac_envs, obs_shape=(sac_history_length, 5))
                     sac_agent = SACAgent(sac_config, sac_envs)
                     sac_load_dir, sac_load_name = sac_model_load
                     sac_agent.load_model(sac_load_dir, sac_load_name)

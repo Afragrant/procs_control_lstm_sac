@@ -29,12 +29,11 @@ batch_size: 128
 learning_rate_actor: 0.0003
 learning_rate_critic: 0.0003
 learning_rate_alpha: 0.0003
-gamma: 0.995
+gamma: 0.99
 alpha: 0.2
 use_automatic_entropy_tuning: True
-
-# seed 21 在 0.55 下结束时温度 0.94，17.5 万步后确定性动作变差。与 MLP 对齐到 0.3。
-target_entropy: 0.3
+# 与 Recurrent-SAC 相同：1 维动作的 -action_dim。
+target_entropy: -1
 tau: 0.005
 
 training_frequency: 8
@@ -43,7 +42,7 @@ start_training: 5000
 n_epochs: 1
 
 use_grad_clip: True
-grad_clip_norm: 0.5
+grad_clip_norm: 0.2
 use_obsnorm: True
 obsnorm_range: 5
 

@@ -115,9 +115,9 @@ class ProcsEnv(gym.Env):
         self.n_inner = n_inner
         self._slow_beta = 1.0 - math.exp(-(1.0 / self.control_freq) / SLOW_MEAN_TAU_S)
 
-        # 可观测：y1[m], v1[m/s], a1[m/s²], a_{t-1}。车速和接触力不进观测。
-        obs_low = np.array([-1.0, -50.0, -500.0, -1.0], dtype=np.float32)
-        obs_high = np.array([1.0, 50.0, 500.0, 1.0], dtype=np.float32)
+        # 可观测：y1[m], v1[m/s], a1[m/s²], v_train[m/s], a_{t-1}。接触力不进观测。
+        obs_low = np.array([-1.0, -50.0, -500.0, 0.0, -1.0], dtype=np.float32)
+        obs_high = np.array([1.0, 50.0, 500.0, 120.0, 1.0], dtype=np.float32)
         self.observation_space = gym.spaces.Box(obs_low, obs_high, dtype=np.float32)
 
         # 动作空间：归一化后 [-1, 1]，再映射为 ±action_max N
@@ -181,9 +181,9 @@ class ProcsEnv(gym.Env):
         return math.ceil((k_end - max(1, k_start)) / self.n_inner)
 
     def _observation(self) -> np.ndarray:
-        # 末维是产生当前观测的上一步归一化动作；reset 时为 0。当前步动作只进评论家。
+        # [y1, v1, a1, v_train, a_{t-1}]。Fc 留在仿真量里。
         plant = self._core.current_observation().astype(np.float32)
-        return np.concatenate([plant[:3], np.array([self._previous_action], dtype=np.float32)])
+        return np.concatenate([plant[:4], np.array([self._previous_action], dtype=np.float32)])
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)

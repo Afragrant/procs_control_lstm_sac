@@ -551,6 +551,8 @@ def plot_force_waveform(
     force_key: str,
     ylabel: str,
     *,
+    x_key: str = 'time_s',
+    xlabel: str = '时间/s',
     show_target: bool = False,
 ) -> None:
     speeds = tuple(runs_by_speed)
@@ -560,11 +562,11 @@ def plot_force_waveform(
         for policy in policies:
             result = runs_by_speed[speed][policy]
             trajectory = result['trajectory']
-            if not trajectory['time_s']:
+            if not trajectory[x_key]:
                 continue
             style = POLICY_PLOT_STYLES.get(policy, {'label': policy, 'color': None})
             axis.plot(
-                trajectory['time_s'],
+                trajectory[x_key],
                 trajectory[force_key],
                 label=style['label'],
                 color=style['color'],
@@ -574,7 +576,7 @@ def plot_force_waveform(
         if show_target and target_force is not None:
             axis.axhline(target_force, color='k', linestyle='--', linewidth=1.0, label='target')
         axis.set_title(f'{int(speed)} km/h')
-        axis.set_xlabel('时间/s', fontproperties=_CJK)
+        axis.set_xlabel(xlabel, fontproperties=_CJK)
         axis.set_ylabel(ylabel, fontproperties=_CJK)
         axis.grid(True, alpha=0.3)
         if axis.lines:
@@ -630,6 +632,7 @@ def plot_force_spectrum(
     speeds = tuple(runs_by_speed)
     fig, axes = _figure_axes(len(speeds))
     for axis, speed in zip(axes, speeds, strict=True):
+        speed_mps = float(speed) / 3.6
         for policy in policies:
             trajectory = runs_by_speed[speed][policy]['trajectory']
             time_s = np.asarray(trajectory['time_s'], dtype=np.float64)
@@ -639,19 +642,20 @@ def plot_force_spectrum(
             density = np.asarray(psd['psd_N2_Hz'])
             if freq.size == 0:
                 continue
+            # S(Ω) dΩ = S(f) df，Ω = f/v
             style = POLICY_PLOT_STYLES.get(policy, {'label': policy, 'color': None})
             axis.plot(
-                freq,
-                density,
+                freq / speed_mps,
+                density * speed_mps,
                 label=style['label'],
                 color=style['color'],
                 linestyle='--' if policy == 'zero_control' else '-',
                 linewidth=1.2,
             )
         axis.set_title(f'{int(speed)} km/h')
-        axis.set_xlabel('频率/Hz', fontproperties=_CJK)
-        axis.set_ylabel('功率谱密度/(N²/Hz)', fontproperties=_CJK)
-        axis.set_xlim(0.0, fmax_hz)
+        axis.set_xlabel('空间频率/(1/m)', fontproperties=_CJK)
+        axis.set_ylabel('功率谱密度/(N²·m)', fontproperties=_CJK)
+        axis.set_xlim(0.0, fmax_hz / speed_mps)
         axis.set_ylim(bottom=0.0)
         axis.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
         if axis.lines:
@@ -707,6 +711,8 @@ def _write_eval_outputs(out_dir: Path, runs_by_speed: dict[float, dict[str, dict
         policies,
         'contact_force_N',
         '接触力/N',
+        x_key='position_m',
+        xlabel='运行距离/m',
         show_target=True,
     )
     print(f'wrote {contact_plot}')
@@ -719,7 +725,15 @@ def _write_eval_outputs(out_dir: Path, runs_by_speed: dict[float, dict[str, dict
     )
     print(f'wrote {contact_psd_plot}')
     control_plot = out_dir / 'control_force_waveform.png'
-    plot_force_waveform(control_plot, runs_by_speed, policies, 'control_force_N', '控制力/N')
+    plot_force_waveform(
+        control_plot,
+        runs_by_speed,
+        policies,
+        'control_force_N',
+        '控制力/N',
+        x_key='position_m',
+        xlabel='运行距离/m',
+    )
     print(f'wrote {control_plot}')
     control_psd_csv = out_dir / 'control_force_psd.csv'
     write_psd_csv(control_psd_csv, runs_by_speed, policies, 'control_force_N', fmax_hz=CONTROL_SPECTRUM_HZ)

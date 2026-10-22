@@ -106,7 +106,7 @@ def run(
     envs = make_envs(config)
     agent = None
     try:
-        assert_spaces(envs, obs_shape=(history_length, 4))
+        assert_spaces(envs, obs_shape=(history_length, 5))
         from algorithm.Greedy_SAC import GreedySACAgent
 
         agent = GreedySACAgent(config, envs)

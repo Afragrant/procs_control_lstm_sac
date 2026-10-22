@@ -39,7 +39,7 @@ from utils.run_utils import (
     validate_sac_training_steps,
 )
 
-OBS_SHAPE = (4,)
+OBS_SHAPE = (5,)
 
 
 def require_memoryless(config) -> None:

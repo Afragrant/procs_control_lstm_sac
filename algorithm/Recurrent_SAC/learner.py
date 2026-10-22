@@ -10,7 +10,6 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from algorithm.SAC.learner import resolve_target_entropy
 from algorithm.SAC.policy import RunningObsNorm
 
 from .encoder import replay_prefix
@@ -85,7 +84,7 @@ class RecurrentSACLearner:
         self.gamma = float(config.gamma)
         self.tau = float(config.tau)
         self.auto_alpha = bool(config.use_automatic_entropy_tuning)
-        self.target_entropy = resolve_target_entropy(config, action_dim)
+        self.target_entropy = -float(action_dim)
         self.use_grad_clip = bool(getattr(config, 'use_grad_clip', False))
         self.grad_clip_norm = float(getattr(config, 'grad_clip_norm', 0.5))
         hidden = _hidden_size(config)
@@ -151,7 +150,7 @@ class RecurrentSACLearner:
             )
             predictions.append(critic.head(features[:, :-1], batch.action).squeeze(-1))
         prediction = torch.stack(predictions, dim=0)
-        per_q = F.smooth_l1_loss(prediction, target.detach().expand_as(prediction), reduction='none')
+        per_q = F.mse_loss(prediction, target.detach().expand_as(prediction), reduction='none')
         return masked_mean(per_q.sum(0), batch.mask)
 
     @torch.no_grad()
